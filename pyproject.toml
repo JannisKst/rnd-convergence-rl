@@ -1,0 +1,54 @@
+[project]
+name = "rnd-convergence"
+version = "0.1.0"
+description = "RND prediction error as a convergence indicator in RL (RL lecture project, LUH 2026)"
+authors = [
+  { name = "Jannis Kastner" },
+  { name = "Tom Sommerfeld" },
+]
+readme = "README.md"
+requires-python = "~=3.11.0"
+keywords = ["Reinforcement Learning", "Random Network Distillation", "Convergence Detection"]
+
+dependencies = [
+  "numpy",
+  "gymnasium[box2d]",
+  "torch",
+  "matplotlib",
+  "minigrid",
+  "pandas<3.0",
+  "hydra-core",
+  "hydra-colorlog",
+  "stable-baselines3>=2.0.0",
+  "rliable",
+  "tqdm",
+  "seaborn",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=4.6",
+  "ruff",
+  "pre-commit",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["rnd_convergence", "tests", "scripts"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rnd_convergence"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rnd_convergence*"]

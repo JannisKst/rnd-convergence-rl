@@ -1,0 +1,16 @@
+defaults:
+  - _self_
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+env_id: CartPole-v1
+seed: 0
+n_episodes: 5

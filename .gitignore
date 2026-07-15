@@ -1,0 +1,38 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+.env
+.venv/
+venv/
+uv.lock
+
+# Hydra / experiment outputs
+outputs/
+multirun/
+results/
+logs/
+wandb/
+runs/
+
+# Model weights & large artifacts
+*.pt
+*.pth
+*.ckpt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+CLAUDE.md
