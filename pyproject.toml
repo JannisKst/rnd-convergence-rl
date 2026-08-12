@@ -12,6 +12,7 @@ keywords = ["Reinforcement Learning", "Random Network Distillation", "Convergenc
 
 dependencies = [
   "numpy",
+  "scipy",
   "gymnasium[box2d]",
   "torch",
   "matplotlib",
