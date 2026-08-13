@@ -1,0 +1,26 @@
+env_id,signal_label,n_runs,n_defined,mean,ci_low,ci_high,plateau_rate
+MarsRover,RND,1,1,20488.0,,,1.0
+MarsRover,SVE grid b5,1,1,6488.0,,,1.0
+MarsRover,SVE grid b10,1,1,17488.0,,,1.0
+MarsRover,SVE grid b20,1,1,17488.0,,,1.0
+MarsRover,SVE kNN,1,1,6488.0,,,1.0
+MiniGrid-Empty-5x5-v0,RND,5,5,33929.6,30833.6,36796.8,1.0
+MiniGrid-Empty-5x5-v0,SVE grid b5,5,1,58616.0,,,0.2
+MiniGrid-Empty-5x5-v0,SVE grid b10,5,0,,,,0.0
+MiniGrid-Empty-5x5-v0,SVE grid b20,5,0,,,,0.0
+MiniGrid-Empty-5x5-v0,SVE kNN,5,0,,,,0.0
+MiniGrid-DoorKey-8x8-v0,RND,1,0,,,,1.0
+MiniGrid-DoorKey-8x8-v0,SVE grid b5,1,0,,,,0.0
+MiniGrid-DoorKey-8x8-v0,SVE grid b10,1,0,,,,0.0
+MiniGrid-DoorKey-8x8-v0,SVE grid b20,1,0,,,,0.0
+MiniGrid-DoorKey-8x8-v0,SVE kNN,1,0,,,,0.0
+CartPole-v1,RND,1,1,17020.0,,,1.0
+CartPole-v1,SVE grid b5,1,0,,,,0.0
+CartPole-v1,SVE grid b10,1,0,,,,0.0
+CartPole-v1,SVE grid b20,1,0,,,,0.0
+CartPole-v1,SVE kNN,1,0,,,,0.0
+LunarLander-v3,RND,1,1,-41552.0,,,1.0
+LunarLander-v3,SVE grid b5,1,0,,,,0.0
+LunarLander-v3,SVE grid b10,1,0,,,,0.0
+LunarLander-v3,SVE grid b20,1,0,,,,0.0
+LunarLander-v3,SVE kNN,1,0,,,,0.0

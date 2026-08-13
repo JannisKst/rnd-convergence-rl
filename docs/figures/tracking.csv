@@ -1,0 +1,6 @@
+signal_label,n_pairs,n_runs,t_conv_range,t_plateau_range,spearman,p_value,slope
+RND,12,12,18432.0,30000.0,0.4953659797306823,0.10150764791094327,1.2992891630901278
+SVE grid b5,0,12,,,,,
+SVE grid b10,0,12,,,,,
+SVE grid b20,0,12,,,,,
+SVE kNN,0,12,,,,,

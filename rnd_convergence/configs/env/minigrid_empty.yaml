@@ -7,9 +7,16 @@
 id: MiniGrid-Empty-5x5-v0
 kwargs: {}
 
+# 20 evaluation episodes rather than the 10 the other rungs use. The greedy return here is
+# all-or-nothing --- 0.955 or 0.0, depending on which start state the episode drew --- so an
+# evaluation point is a mean of Bernoulli draws, and retained = R(t_plateau) / R_ref divides
+# one such mean by a small difference of two others. At 10 episodes that ratio came out
+# between -1.26 and 4.39 across seeds, which is the estimator's noise rather than a
+# non-monotonic return curve. MiniGrid episodes are short, so the extra episodes are close to
+# free here in a way they would not be on CartPole or LunarLander.
 total_steps: 300_000
 eval_interval: 5_000
-eval_episodes: 10
+eval_episodes: 20
 rollout_steps: 2_048
 
 signal_window: 10_000

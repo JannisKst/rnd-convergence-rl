@@ -1,0 +1,26 @@
+env_id,signal_label,fired,n_configs,n_seeds
+MarsRover,RND,1.0,18,1
+MarsRover,SVE grid b5,1.0,18,1
+MarsRover,SVE grid b10,1.0,18,1
+MarsRover,SVE grid b20,1.0,18,1
+MarsRover,SVE kNN,0.8333333333333334,18,1
+MiniGrid-Empty-5x5-v0,RND,0.9777777777777777,18,5
+MiniGrid-Empty-5x5-v0,SVE grid b5,0.6666666666666666,18,5
+MiniGrid-Empty-5x5-v0,SVE grid b10,0.5888888888888889,18,5
+MiniGrid-Empty-5x5-v0,SVE grid b20,0.5777777777777777,18,5
+MiniGrid-Empty-5x5-v0,SVE kNN,0.2222222222222222,18,5
+MiniGrid-DoorKey-8x8-v0,RND,0.9444444444444444,18,1
+MiniGrid-DoorKey-8x8-v0,SVE grid b5,0.5555555555555556,18,1
+MiniGrid-DoorKey-8x8-v0,SVE grid b10,0.5,18,1
+MiniGrid-DoorKey-8x8-v0,SVE grid b20,0.3333333333333333,18,1
+MiniGrid-DoorKey-8x8-v0,SVE kNN,0.3333333333333333,18,1
+CartPole-v1,RND,1.0,18,1
+CartPole-v1,SVE grid b5,0.7777777777777778,18,1
+CartPole-v1,SVE grid b10,0.6666666666666666,18,1
+CartPole-v1,SVE grid b20,0.5,18,1
+CartPole-v1,SVE kNN,0.5,18,1
+LunarLander-v3,RND,0.8333333333333334,18,1
+LunarLander-v3,SVE grid b5,0.3333333333333333,18,1
+LunarLander-v3,SVE grid b10,0.3333333333333333,18,1
+LunarLander-v3,SVE grid b20,0.4444444444444444,18,1
+LunarLander-v3,SVE kNN,0.5,18,1

@@ -8,9 +8,13 @@
 id: MiniGrid-DoorKey-8x8-v0
 kwargs: {}
 
+# 20 evaluation episodes, matching minigrid_empty and for the same reason: the greedy return
+# on a MiniGrid rung is all-or-nothing per episode, so the evaluation curve is a Bernoulli
+# mean and `retained` divides one by a difference of two. Episodes here are capped short
+# enough that the extra ten cost little.
 total_steps: 500_000
 eval_interval: 5_000
-eval_episodes: 10
+eval_episodes: 20
 rollout_steps: 2_048
 
 signal_window: 10_000

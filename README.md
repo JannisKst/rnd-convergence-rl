@@ -163,23 +163,40 @@ practical cost of acting on each signal.
 2. **Coverage-vs-convergence check.** Both candidate signals measure state-space coverage, not policy
    quality. We report explicitly where exploration saturates before policy improvement finishes —
    i.e. the regime in which neither signal is a safe stopping criterion.
-3. **SVE-plateau feasibility.** On a pilot 100k-step CartPole run the grid SVE curve did not plateau
-   in any of 18 detector configurations (window ∈ {5k, 10k} × `smooth_window` ∈ {1, 5, 9} × `τ` ∈
-   {0.1, 0.3, 0.5}), nor did the kNN variant; cumulative mode fired in only 2 of 9. Occupancy peaked
-   at 0.077, so this is *not* the saturation case below — the curve simply wobbles at an amplitude
-   comparable to its own drift, which is the noise-floor limit. That is a legitimate finding about
-   the baseline, but it means the SVE column may be empty on a rung where SVE is supposed to still
-   work. It is settled on a pilot run per rung *before* the full matrix is launched, since an empty
-   baseline column is not something to discover after 50 cluster runs.
+3. **SVE-plateau feasibility, i.e. detector robustness.** A signal that only flattens under one
+   hand-picked `τ` is not a usable stopping criterion however good its `Δ` looks at that `τ`, so the
+   *fraction of detector configurations in which a signal plateaus at all* is measured per rung and
+   reported next to `Δ` rather than treated as a diagnostic. The denominator is the sweep
+   `τ` × `smooth_window` × `reference_quantile` — 18 configurations — times the seeds of the rung.
+
+   Measured on the shared window grid, RND plateaus in 0.83–1.00 of them on every rung, while grid
+   SVE runs 1.00 at 1-D down to 0.33 at 8-D and falls further as bins are added within a rung (0.78
+   → 0.67 → 0.50 across b5 → b10 → b20 on CartPole); the kNN variant is the least robust of the
+   three on the discrete rungs. Bin-count dependence therefore shows up in *whether* the detector
+   fires, not only in where — which is the study's hypothesis appearing one level earlier than
+   expected. `docs/figures/detector_robustness.png` is that measurement; the rate is also printed in
+   every cell of the `Δ` table, since a cell whose mean rests on two of five seeds is a different
+   claim from one that rests on five.
+
+   Feasibility is settled on a pilot run per rung *before* the full matrix is launched: a baseline
+   column that turns out to be empty is not something to discover after 50 cluster runs.
 4. **Grid-saturation check.** Once cells outnumber samples badly enough that nearly every sample owns
    a cell, the histogram is uniform over `N` cells and grid SVE returns `log N` *identically*,
-   whatever the policy does — at 8-D with 20 bins and a 5 000-step window it is already within `1e-3`
-   of `log 5000`. A flat SVE curve there is arithmetic about sample counts, not evidence about
-   exploration. Occupancy is therefore reported in every cell of the table so that measurements and
-   ceilings are distinguishable, and Miller–Madow bias correction is available as a sensitivity
+   whatever the policy does. A flat SVE curve there is arithmetic about sample counts, not evidence
+   about exploration. Occupancy is therefore reported in every cell of the table so that measurements
+   and ceilings are distinguishable, and Miller–Madow bias correction is available as a sensitivity
    check (`--corrections none miller_madow`). This is a real limit of the baseline rather than a bug,
    but the study only earns the claim "SVE degrades with dimensionality" if it can show the
    degradation is not just the estimator running out of samples.
+
+   The ceiling is reached less easily than a cell count suggests, and that is worth stating because
+   it is what licenses the 8-D row. Counting cells alone, 20 bins in 8 dimensions gives `20⁸ ≈ 2.6e10`
+   against 20 000 states per window, so every state should own its own cell and occupancy should sit
+   at 1.0. Measured on LunarLander it is 0.14–0.24 at `b20` (0.05–0.09 at `b10`), and grid SVE reads
+   6.35 nats against a `log N` ceiling of 9.90 — because a policy's states are strongly clustered
+   rather than spread over the reachable box. So the degradation reported at 8-D is the estimator
+   coarsening, not the estimator pinned at its ceiling; the check has to be read off measured
+   occupancy rather than off the arithmetic of `bins^dim`.
 
    The column to read is `occupancy_at_plateau`, not `occupancy_max`. The claim being defended is
    "the plateau this row reports is arithmetic, not exploration", which is a statement about the grid
@@ -216,10 +233,12 @@ control. Runs are independent and executed as a job array on the cluster.
 ```
 rnd_convergence/          Python package: agents, RND networks, convergence metrics
 rnd_convergence/configs/  Hydra configs (base + per-agent/per-env)
-scripts/                  Entry points: train.py (one run on one rung), analyze.py (runs -> frame)
+scripts/                  Entry points: train.py (one run on one rung), analyze.py (runs -> frame),
+                          report.py (frame -> the table and figures)
 tests/                    Unit tests
 docs/                     Proposal and report material
 docs/results/             The committed frame and curves the report is written from
+docs/figures/             The table and figures report.py builds from them
 ```
 
 Raw experiment outputs (`outputs/`, `results/`, model weights) are git-ignored; curated figures and
@@ -293,6 +312,39 @@ Three things need reading together with the rest:
 - **`analysis_seed`.** Only the RND replay and a subsampling kNN estimate depend on it; where it is
   empty the curve is exact and one seed is the whole story. A spread over analysis seeds is
   meaningful only on rows that carry one.
+
+### Reporting
+
+The table and the figures are a second offline pass, over the committed frame alone:
+
+```bash
+python scripts/report.py                                     # docs/results/ -> docs/figures/
+python scripts/report.py --tau 0.2 --smooth-window 9         # the same table elsewhere in the sweep
+python scripts/report.py --conditions lr1e-3 lr3e-4 lr1e-4   # does a plateau track convergence?
+```
+
+It reads `signals.csv` and `curves/` and never replays a state stream — those streams are hundreds
+of megabytes and are not in the repository, so a reporting step that needed them could not be run by
+whoever picks this up. Writing the `Δ` table and the figures from one frame is also what keeps them
+the same measurement: the rings on the confound figure are the detections the table reports, not a
+second detector run at plotting time.
+
+Four artefacts, plus the `.csv` behind each:
+
+- **The `Δ` table**, rungs down the ladder against signals, aggregated over seeds with a percentile
+  bootstrap CI at one pinned detector setting named in the caption, each cell carrying the rate at
+  which the signal fired and each row the rate at which `t_conv` was defined.
+- **Detector robustness** — control 3 above, as a figure.
+- **`Δ` sensitivity** — the same cells measured at every detector configuration, drawn as a band on a
+  symmetric-log axis. `Δ` moves by tens of thousands of steps across that sweep, so the band is the
+  honest form of the result and the pinned number is a reading inside it.
+- **The confound figure** — trained against frozen curves for both signals on one rung, which is
+  control 1 in one picture.
+
+`--conditions` adds the discrimination experiment: it compares runs written under a `run_tag`, so
+several training conditions can live in one results directory, and pairs `t_conv` with `t_plateau`
+*within* each run to report whether the plateau moves with convergence or sits at a fixed step.
+A signal that is stably wrong is robust and useless, and only that pairing tells the two apart.
 
 ## Development
 
