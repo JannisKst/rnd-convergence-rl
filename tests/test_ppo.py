@@ -10,6 +10,7 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
+from rnd_convergence.convergence import convergence_report
 from rnd_convergence.ppo import PPOAgent
 from rnd_convergence.streams import EvalCurve, StateStream
 
@@ -252,3 +253,28 @@ class TestLearning:
 
         assert curve.mean_returns[-1] > baseline + 50
         assert curve.mean_returns[-1] > 150
+
+    def test_run_shorter_than_one_eval_interval_produces_an_empty_curve(self):
+        # No evaluation fires, so eval_returns is empty and reshape cannot infer the
+        # episode count. Crashing here would discard a completed training run.
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
+        stream, curve = agent.train(128, eval_interval=5_000, eval_episodes=3, random_episodes=1)
+
+        assert stream.n_steps == 128
+        assert curve.steps.size == 0
+        assert curve.returns.shape == (0, 3)
+        assert convergence_report(curve).status == "not_learned"
+
+    def test_update_losses_are_retained_for_debugging(self):
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
+        agent.train(256, eval_interval=128, eval_episodes=1, random_episodes=1)
+
+        assert len(agent.update_log) == 4
+        assert set(agent.update_log[0]) == {
+            "step",
+            "mean_reward",
+            "policy_loss",
+            "value_loss",
+            "entropy",
+        }
+        assert all(np.isfinite(list(entry.values())).all() for entry in agent.update_log)

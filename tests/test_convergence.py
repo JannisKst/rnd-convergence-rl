@@ -275,3 +275,55 @@ class TestRetainedPerformanceConsistency:
     def test_n_final_is_keyword_only(self):
         with pytest.raises(TypeError):
             retained_performance(make_curve([0.0] * 5 + [100.0] * 5), 30_000, 5)
+
+
+class TestMinimumCurveLength:
+    """The detector has a structural minimum of ``min_points + patience`` points.
+
+    changes has n-1 entries and the first min_points-1 are suppressed, so below that
+    there is no window position where the criterion could ever be met. Returning None
+    would file "the curve is too coarse to answer" under "the signal never plateaued".
+    """
+
+    def test_too_few_points_raises(self):
+        values = np.linspace(10.0, 1.0, 9)
+        steps = np.arange(1, 10, dtype=np.int64) * 10_000
+        with pytest.raises(ValueError, match="at least 10 curve points"):
+            plateau_time(steps, values)
+
+    def test_exactly_two_patience_points_is_allowed(self):
+        values = np.concatenate([np.linspace(10.0, 1.0, 5), np.full(5, 1.0)])
+        steps = np.arange(1, 11, dtype=np.int64) * 10_000
+        assert plateau_time(steps, values) is None or True  # must not raise
+
+    def test_the_bound_follows_patience(self):
+        steps = np.arange(1, 7, dtype=np.int64) * 10_000
+        values = np.linspace(10.0, 1.0, 6)
+        with pytest.raises(ValueError, match="at least 8 curve points"):
+            plateau_time(steps, values, patience=4)
+
+    def test_min_points_shifts_the_bound(self):
+        # min_points=2 + patience=5 requires 7 points: 7 is accepted, 6 is not.
+        steps = np.arange(1, 8, dtype=np.int64) * 10_000
+        values = np.linspace(10.0, 1.0, 7)
+        plateau_time(steps, values, min_points=2)  # must not raise
+
+        with pytest.raises(ValueError, match=r"min_points=2 \+ patience=5"):
+            plateau_time(steps[:6], values[:6], min_points=2)
+
+    def test_min_points_lets_the_detector_fire_earlier(self):
+        # Documented behaviour of the parameter: it controls how many leading points are
+        # suppressed before the detector may fire.
+        values = np.concatenate([np.linspace(10.0, 9.0, 3), np.full(20, 9.0)])
+        steps = np.arange(1, 24, dtype=np.int64) * 5_000
+        assert plateau_time(steps, values, min_points=1) <= plateau_time(steps, values)
+
+    def test_a_100k_run_at_window_10k_is_at_the_boundary(self):
+        # The concrete case: 100k steps / 10k window = 10 points, exactly the minimum,
+        # leaving a single valid window position. The README protocol has to state a
+        # budget that clears this comfortably.
+        steps = np.arange(1, 11, dtype=np.int64) * 10_000
+        values = 10.0 * np.exp(-np.arange(10) / 3.0) + 1.0
+        plateau_time(steps, values)  # must not raise
+        with pytest.raises(ValueError, match="at least 10"):
+            plateau_time(steps[:9], values[:9])

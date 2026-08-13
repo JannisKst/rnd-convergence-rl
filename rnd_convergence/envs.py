@@ -26,7 +26,10 @@ import minigrid  # noqa: F401  -- imported for its side effect of registering Mi
 import numpy as np
 from gymnasium.spaces.utils import flatten
 
+from rnd_convergence.mars_rover import MarsRover
+
 MINIGRID_PREFIX = "MiniGrid-"
+MARS_ROVER_ID = "MarsRover"
 
 
 class MiniGridStateWrapper(gym.ObservationWrapper):
@@ -62,9 +65,12 @@ class MiniGridStateWrapper(gym.ObservationWrapper):
 def make_env(env_id: str, **kwargs: Any) -> gym.Env:
     """Build a ladder environment with the wrappers that rung needs.
 
-    MiniGrid ids get :class:`MiniGridStateWrapper`; everything else is returned as
-    ``gymnasium`` builds it.
+    ``"MarsRover"`` builds :class:`~rnd_convergence.mars_rover.MarsRover`, which has no
+    Gymnasium id. MiniGrid ids get :class:`MiniGridStateWrapper`. Everything else is
+    returned as ``gymnasium`` builds it.
     """
+    if env_id == MARS_ROVER_ID:
+        return MarsRover(**kwargs)
     env = gym.make(env_id, **kwargs)
     if env_id.startswith(MINIGRID_PREFIX):
         return MiniGridStateWrapper(env)
@@ -72,13 +78,24 @@ def make_env(env_id: str, **kwargs: Any) -> gym.Env:
 
 
 def state_fn_for(env: gym.Env) -> Callable[[Any], np.ndarray]:
-    """The ``state_fn`` to log for ``env``: the observation itself, flattened.
+    """The ``state_fn`` to log for ``env``: its compact state, as a float vector.
 
-    Because :func:`make_env` already reduces every rung to its compact state, the logged
-    state and the policy input coincide and this is just a flatten. It exists as a named
-    function so that a rung which later needs them to differ has one place to say so.
+    A ``Discrete`` observation space is logged as the raw integer, *not* as the one-hot
+    vector the policy consumes. MarsRover is the case that matters: the ladder calls it
+    the 1-D rung, and one-hot encoding would make the entropy baseline see 5 dimensions.
+    The policy still receives the one-hot, which is the right input for a network.
+
+    For every other rung :func:`make_env` has already reduced the observation to the
+    compact state, so this is just a flatten and the two coincide.
     """
     space = env.observation_space
+
+    if isinstance(space, gym.spaces.Discrete):
+
+        def discrete_state_fn(obs: Any) -> np.ndarray:
+            return np.asarray([obs], dtype=np.float32)
+
+        return discrete_state_fn
 
     def state_fn(obs: Any) -> np.ndarray:
         return np.asarray(flatten(space, obs), dtype=np.float32)

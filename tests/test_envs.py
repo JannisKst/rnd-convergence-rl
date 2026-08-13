@@ -11,6 +11,7 @@ import pytest
 from gymnasium.spaces.utils import flatdim
 
 from rnd_convergence.envs import MiniGridStateWrapper, make_env, state_fn_for
+from rnd_convergence.mars_rover import MarsRover
 from rnd_convergence.ppo import PPOAgent
 
 MINIGRID_ID = "MiniGrid-Empty-5x5-v0"
@@ -77,3 +78,49 @@ class TestPPOOnMiniGrid:
         agent = PPOAgent(lambda: make_env(MINIGRID_ID), rollout_steps=32, seed=0)
         rollout = agent.collect_rollout(32)
         assert np.array_equal(rollout.states, rollout.observations)
+
+
+class TestMarsRoverRung:
+    def test_make_env_builds_the_anchor_rung(self):
+        # README lists MarsRover as the anchor rung; it has no Gymnasium id, so make_env
+        # has to special-case it or the documented ladder does not run.
+        env = make_env("MarsRover")
+        assert isinstance(env, MarsRover)
+        assert env.observation_space.n == 5
+
+    def test_logged_state_is_one_dimensional_not_one_hot(self):
+        # The ladder calls this the 1-D rung. flatten() of a Discrete space gives a
+        # 5-wide one-hot, which would make the entropy baseline see 5 dimensions.
+        env = make_env("MarsRover")
+        obs, _ = env.reset(seed=0)
+        assert state_fn_for(env)(obs).shape == (1,)
+        assert state_fn_for(env)(obs)[0] == obs
+
+    def test_policy_sees_the_one_hot_while_the_stream_logs_the_integer(self):
+        env = make_env("MarsRover")
+        agent = PPOAgent(
+            lambda: make_env("MarsRover"),
+            state_fn=state_fn_for(env),
+            rollout_steps=64,
+            seed=0,
+        )
+        assert agent.obs_dim == 5  # one-hot, the right input for a network
+        assert agent.state_dim == 1  # the 1-D state the ladder claims
+
+        stream, _ = agent.train(256, eval_interval=256, eval_episodes=2, random_episodes=2)
+        assert stream.obs_dim == 1
+        assert set(np.unique(stream.observations).tolist()) <= {0.0, 1.0, 2.0, 3.0, 4.0}
+
+    def test_ladder_dimensions_match_the_readme_table(self):
+        expected = {
+            "MarsRover": 1,
+            "MiniGrid-Empty-5x5-v0": 3,
+            "MiniGrid-DoorKey-5x5-v0": 3,
+            "MiniGrid-DoorKey-8x8-v0": 3,
+            "CartPole-v1": 4,
+            "LunarLander-v3": 8,
+        }
+        for env_id, dim in expected.items():
+            env = make_env(env_id)
+            obs, _ = env.reset(seed=0)
+            assert state_fn_for(env)(obs).shape == (dim,), env_id

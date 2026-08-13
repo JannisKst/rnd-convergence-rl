@@ -41,7 +41,12 @@ fires at step 50k is perfectly robust and perfectly useless.
 | LunarLander-v3 (discrete) | continuous | 8 | binning breaks (curse of dimensionality) |
 
 All rungs use **discrete action spaces**, so a single PPO implementation covers the ladder and no
-algorithmic difference confounds the comparison.
+algorithmic difference confounds the comparison. Every rung is built by `rnd_convergence.envs.make_env`,
+which applies the per-rung treatment needed to make the *Dim* column true: MarsRover has no Gymnasium
+id and is implemented in `rnd_convergence/mars_rover.py`, and its integer position is logged as 1-D
+rather than as the 5-wide one-hot the policy consumes; MiniGrid's default observation is a `Dict` of a
+7×7×3 image and a mission string, which `MiniGridStateWrapper` replaces with the underlying
+`(x, y, dir)`. A test asserts the table's dimensions against what `make_env` actually produces.
 
 The two MiniGrid rungs serve different purposes: the easy variant is expected to converge and yield a
 well-defined `t_conv`; the hard sparse-reward variant is expected to defeat PPO without an
@@ -107,8 +112,18 @@ change anywhere in the run, so one transient spike — exactly what RND error do
 region — relaxes the threshold for every later point; on synthetic curves that moves `t_plateau` by
 tens of thousands of steps, always earlier. `τ` is bounded below by the signal's noise floor: below
 roughly `τ = 0.1` the criterion stops firing at all on noisy signals, and "never fired" is
-indistinguishable from "never plateaued". The `τ` sweep therefore runs over `{0.1, 0.2, 0.3}` and
-reports where the edge is, with `reference_quantile = 1.0` (the maximum) as a sensitivity check.
+indistinguishable from "never plateaued".
+
+Two settings, not one, therefore have to be swept and reported: **`τ` × `smooth_window`**. On a pilot
+100k-step CartPole run, RND's `Δ` moved 13 616 → 33 616 → 48 616 purely from `smooth_window` at fixed
+`τ`. Since `Δ` is the number the project reports, the detector settings are pinned per signal and
+stated with the table, with `reference_quantile = 1.0` (the maximum) as a sensitivity check.
+
+**Curve resolution.** The detector needs at least `min_points + patience` curve points — 10 at the
+defaults — because differencing costs one point and the leading `min_points − 1` are suppressed. A
+100k-step run measured at `window = 10_000` yields exactly 10 and can only ever answer at the final
+point; `plateau_time` raises rather than returning `None` below the bound, so this cannot be mistaken
+for "no plateau". Runs are therefore sized so that `total_steps / window ≥ 40`.
 
 ### Reported quantities
 
@@ -127,7 +142,15 @@ practical cost of acting on each signal.
 2. **Coverage-vs-convergence check.** Both candidate signals measure state-space coverage, not policy
    quality. We report explicitly where exploration saturates before policy improvement finishes —
    i.e. the regime in which neither signal is a safe stopping criterion.
-3. **Grid-saturation check.** Once cells outnumber samples badly enough that nearly every sample owns
+3. **SVE-plateau feasibility.** On a pilot 100k-step CartPole run the grid SVE curve did not plateau
+   in any of 18 detector configurations (window ∈ {5k, 10k} × `smooth_window` ∈ {1, 5, 9} × `τ` ∈
+   {0.1, 0.3, 0.5}), nor did the kNN variant; cumulative mode fired in only 2 of 9. Occupancy peaked
+   at 0.077, so this is *not* the saturation case below — the curve simply wobbles at an amplitude
+   comparable to its own drift, which is the noise-floor limit. That is a legitimate finding about
+   the baseline, but it means the SVE column may be empty on a rung where SVE is supposed to still
+   work. It is settled on a pilot run per rung *before* the full matrix is launched, since an empty
+   baseline column is not something to discover after 50 cluster runs.
+4. **Grid-saturation check.** Once cells outnumber samples badly enough that nearly every sample owns
    a cell, the histogram is uniform over `N` cells and grid SVE returns `log N` *identically*,
    whatever the policy does — at 8-D with 20 bins and a 5 000-step window it is already within `1e-3`
    of `log 5000`. A flat SVE curve there is arithmetic about sample counts, not evidence about
@@ -194,7 +217,9 @@ make install
 All code in this repository was written for this project. Where the architecture of a component
 follows an exercise scaffold from the course repository (`automl-edu/RL-exercises`) — the RND
 target/predictor network pair of week 7, and the PPO agent of week 6 — the corresponding module
-docstring records it.
+docstring records it. `mars_rover.py` follows the *specification* of the week 2 environment, which
+that repository provides complete rather than as a stub; the implementation here is our own and the
+exercise repo is not a dependency.
 
 - Burda et al., 2018 — [Exploration by Random Network Distillation](https://arxiv.org/abs/1810.12894)
 - Schulman et al., 2017 — [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)

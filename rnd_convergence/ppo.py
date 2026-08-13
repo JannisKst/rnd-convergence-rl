@@ -119,6 +119,8 @@ class PPOAgent:
 
         self.rng = np.random.default_rng(seed)
         self.global_step = 0
+        # Per-update diagnostics, appended by train(); not part of the saved artefacts.
+        self.update_log: list[dict[str, float]] = []
         self._obs, _ = self.env.reset(seed=seed)
         self._flat_obs = self._flatten(self._obs)
         self.eval_env.reset(seed=seed + 10_000)
@@ -287,7 +289,16 @@ class PPOAgent:
         return {key: value / max(n_batches, 1) for key, value in totals.items()}
 
     def evaluate(self, n_episodes: int = 10, greedy: bool = True) -> np.ndarray:
-        """Return the per-episode returns of the current policy on the evaluation env."""
+        """Return the per-episode returns of the current policy on the evaluation env.
+
+        Reset is deliberately left unseeded here, unlike in :meth:`random_policy_return`.
+        The baseline is a single number that fixes the convergence threshold for the whole
+        run, so it must not move between calls; these evaluations are a *curve*, and
+        pinning every one of them to the same start states would measure the policy on a
+        fixed handful of episodes rather than on the environment's initial-state
+        distribution. The eval env's RNG still descends from the agent's seed, so a run
+        as a whole stays reproducible.
+        """
         returns = np.zeros(n_episodes, dtype=np.float32)
         for episode in range(n_episodes):
             obs, _ = self.eval_env.reset()
@@ -337,6 +348,9 @@ class PPOAgent:
         Evaluations are triggered on the ``eval_interval`` grid but timestamped with the
         step they actually ran at, so ``EvalCurve.steps`` is not evenly spaced. That is
         the honest record: the alternative labels a policy with a step it was never at.
+
+        Per-update losses are accumulated on ``self.update_log`` for debugging; the two
+        returned artefacts are what the offline analysis consumes.
         """
         env_id = env_id or getattr(self.env.spec, "id", type(self.env).__name__)
         random_return = self.random_policy_return(random_episodes)
@@ -350,7 +364,16 @@ class PPOAgent:
 
         while self.global_step < total_steps:
             rollout = self.collect_rollout(min(self.rollout_steps, total_steps - self.global_step))
-            self.update(rollout)
+            losses = self.update(rollout)
+
+            # Keep the per-update diagnostics. A run in a job array that produces a
+            # never-converging return curve is otherwise impossible to triage after the
+            # fact: a collapsed entropy and a diverging value loss say very different
+            # things about why, and neither is recoverable from the logged artefacts.
+            self.update_log.append(
+                {"step": float(self.global_step), "mean_reward": float(rollout.rewards.mean())}
+                | losses
+            )
 
             state_chunks.append(rollout.states)
             step_chunks.append(rollout.steps)
@@ -379,7 +402,15 @@ class PPOAgent:
         )
         curve = EvalCurve(
             steps=np.asarray(eval_steps, dtype=np.int64),
-            returns=np.asarray(eval_returns, dtype=np.float32).reshape(len(eval_steps), -1),
+            # A run shorter than one eval_interval produces no evaluations at all. Reshape
+            # cannot infer the episode count from an empty list, so the width is stated
+            # explicitly; the downstream detectors already treat an empty curve as
+            # "no t_conv". Failing here would waste the whole training run.
+            returns=(
+                np.asarray(eval_returns, dtype=np.float32).reshape(len(eval_steps), -1)
+                if eval_steps
+                else np.empty((0, eval_episodes), dtype=np.float32)
+            ),
             random_return=random_return,
             env_id=env_id,
             seed=self.seed,

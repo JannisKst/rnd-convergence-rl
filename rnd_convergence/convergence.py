@@ -206,10 +206,23 @@ def plateau_time(
     an exponentially decaying signal has constant slope there and will never be declared
     plateaued, so this is a sensitivity check rather than the default.
 
+    ``min_points`` overrides how many leading points are suppressed before the detector
+    is allowed to fire, which defaults to ``patience``. Lower it only to probe the very
+    start of a curve; the suppression exists because the first few smoothed points sit on
+    a short trailing window and move erratically.
+
     Raises on a signal that never changes at all, rather than returning ``None``: a
     constant signal has no rate to be slow relative to, and reporting it as "never
     plateaued" would hide the saturated-grid case that
     :func:`~rnd_convergence.entropy.grid_occupancy` exists to expose.
+
+    Raises, too, on a curve too short to resolve a plateau. The detector needs
+    ``min_points + patience`` points — ``2 * patience``, i.e. 10, at the defaults —
+    because differencing costs one point and the first ``min_points - 1`` are suppressed.
+    Below that there is no window position where the criterion could ever be met, so the
+    curve resolution has to be checked against the step budget: a 100k-step run measured
+    with ``window=10_000`` yields exactly 10 points and can only ever answer at the very
+    last one.
     """
     if steps.shape != values.shape:
         raise ValueError(
@@ -219,6 +232,14 @@ def plateau_time(
         raise ValueError(f"tau must be > 0, got {tau}")
     if not 0.0 < reference_quantile <= 1.0:
         raise ValueError(f"reference_quantile must be in (0, 1], got {reference_quantile}")
+    floor = patience if min_points is None else min_points
+    required = floor + patience
+    if values.size < required:
+        raise ValueError(
+            f"need at least {required} curve points to resolve a plateau "
+            f"(min_points={floor} + patience={patience}), got {values.size}; "
+            "use a smaller measurement window or a longer run"
+        )
     if values.size and not np.all(np.isfinite(values)):
         # NaN comparisons are False, so a single non-finite point would silently make the
         # detector return None — which in this codebase is the meaningful "the signal
@@ -234,9 +255,6 @@ def plateau_time(
             raise ValueError("log=True requires a strictly positive signal")
         smoothed = np.log(smoothed)
 
-    if smoothed.size < 2:
-        return None
-
     changes = np.abs(np.diff(smoothed))
     if not np.any(changes > 0):
         raise ValueError(
@@ -249,8 +267,6 @@ def plateau_time(
     flags = np.zeros(changes.shape, dtype=bool)
     established = reference > 0
     flags[established] = changes[established] / reference[established] < tau
-
-    floor = patience if min_points is None else min_points
     flags[: max(floor - 1, 0)] = False
 
     index = _first_sustained(flags, patience)
