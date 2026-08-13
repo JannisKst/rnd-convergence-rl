@@ -1,0 +1,18 @@
+# Rung 1, the anchor: 1-D discrete, where SVE is exact and both signals saturate almost
+# immediately.
+#
+# rollout_steps is small here for a reason. Episodes are 10 steps long and the optimal
+# policy is reachable within a few thousand steps, so at the default 2048 the whole run
+# would be ~24 evaluation points and t_conv would land on the first or second one ---
+# making Delta a measurement of the detector's own leading-point suppression rather than
+# of the signal. At 512 the curve has ~97 points and t_conv is resolvable.
+id: MarsRover
+kwargs: {}
+
+total_steps: 50_000
+eval_interval: 500
+eval_episodes: 10
+rollout_steps: 512
+
+signal_window: 5_000
+signal_stride: 500

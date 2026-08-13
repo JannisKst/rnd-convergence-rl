@@ -1,0 +1,24 @@
+# Rung 4 of the ladder: 4-D continuous, where grid SVE starts to be strained.
+#
+# Every rung config carries both halves of the run: the training budget, and the
+# resolution the offline signal curves will be measured at. They belong together because
+# they are jointly constrained, and getting the pair wrong produces an empty cell in the
+# results table rather than an error --- so scripts/train.py checks them before spending
+# any compute.
+#
+#   * eval_interval sets the EvalCurve grid and therefore t_conv. Evaluation can only run
+#     on a rollout boundary, so the effective spacing is max(eval_interval, rollout_steps)
+#     --- which is why rollout_steps is a per-rung setting rather than an agent one.
+#   * signal_window / signal_stride set the RND and entropy curves at analysis time.
+#     plateau_time needs min_points + patience points to fire at all and wants far more to
+#     be meaningful, hence the >= 40 points the check enforces.
+id: CartPole-v1
+kwargs: {}
+
+total_steps: 200_000
+eval_interval: 2_000
+eval_episodes: 10
+rollout_steps: 2_048
+
+signal_window: 5_000
+signal_stride: 2_000

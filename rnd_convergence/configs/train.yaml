@@ -1,0 +1,40 @@
+# One PPO run on one rung of the ladder, writing the artefacts the offline analysis reads.
+#
+#   python scripts/train.py env=cartpole seed=0
+#   python scripts/train.py -m env=cartpole seed=0,1,2,3,4     # a run per seed
+#   python scripts/train.py env=cartpole frozen=true           # the frozen-policy control
+defaults:
+  - base
+  - env: cartpole
+  - _self_
+
+# Where the .npz artefacts go, resolved against the directory the command was run from
+# (Hydra chdir's into its own log directory, so a bare relative path would land there).
+# Set RND_RESULTS_DIR to point the cluster runs at scratch without editing this file.
+out_dir: ${oc.env:RND_RESULTS_DIR,results}
+
+# The frozen-policy control: collect and evaluate exactly as usual, but never update.
+# Tagged separately on disk so it cannot overwrite the trained run of the same seed.
+frozen: false
+run_tag: null
+
+# Episodes used for the random-policy baseline R_0 that anchors t_conv. Measured once,
+# before training, and stored in the EvalCurve.
+random_episodes: 20
+
+# PPO hyperparameters. rollout_steps is deliberately *not* here — it lives in the env
+# config because it bounds the evaluation resolution; see env/cartpole.yaml.
+agent:
+  lr_actor: 3e-4
+  lr_critic: 1e-3
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  epochs: 10
+  batch_size: 64
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden_size: 128
+  n_layers: 2
+  device: cpu

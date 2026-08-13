@@ -1,0 +1,17 @@
+# Rung 3, the sparse-reward case: (x, y, dir), 3-D discrete.
+#
+# DoorKey-8x8 is built to defeat agents without an exploration bonus, so PPO is expected
+# *not* to solve it. That is the point: it is the decoupling case, where coverage
+# saturates while return never converges, and t_conv is legitimately `not_learned`. A
+# generous budget is still worth spending --- "did not learn in 300k steps" is a much
+# weaker statement than "did not learn in 500k".
+id: MiniGrid-DoorKey-8x8-v0
+kwargs: {}
+
+total_steps: 500_000
+eval_interval: 5_000
+eval_episodes: 10
+rollout_steps: 2_048
+
+signal_window: 10_000
+signal_stride: 5_000

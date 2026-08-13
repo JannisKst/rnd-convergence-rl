@@ -1,0 +1,16 @@
+# Rung 2, alternative easy variant: (x, y, dir), 3-D discrete.
+#
+# Held in reserve for the pilot. DoorKey-5x5 needs the pickup and toggle actions and so
+# exercises more of the state space than Empty-5x5, which makes for a more interesting
+# plateau --- but it is also the one that might not converge, which would cost the ladder
+# its second well-defined t_conv. Pick between this and minigrid_empty on pilot evidence.
+id: MiniGrid-DoorKey-5x5-v0
+kwargs: {}
+
+total_steps: 300_000
+eval_interval: 5_000
+eval_episodes: 10
+rollout_steps: 2_048
+
+signal_window: 10_000
+signal_stride: 5_000

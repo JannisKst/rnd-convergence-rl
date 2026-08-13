@@ -142,3 +142,10 @@ class TestEvalCurve:
 
 def test_run_stem_is_stable():
     assert run_stem("MiniGrid-DoorKey-8x8-v0", 3) == "MiniGrid-DoorKey-8x8-v0__seed3"
+
+
+def test_run_stem_tag_separates_conditions_on_the_same_env_and_seed():
+    # The frozen-policy control runs the same environment at the same seed, so without a
+    # tag it would overwrite the trained run it exists to be compared against.
+    assert run_stem("CartPole-v1", 0, "frozen") == "CartPole-v1__frozen__seed0"
+    assert run_stem("CartPole-v1", 0, "frozen") != run_stem("CartPole-v1", 0)

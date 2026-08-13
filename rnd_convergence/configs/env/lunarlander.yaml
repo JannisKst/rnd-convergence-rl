@@ -1,0 +1,15 @@
+# Rung 5, the bottom of the ladder: 8-D continuous, where grid SVE breaks outright.
+#
+# This is the rung carrying the argument, so it gets the real step budget --- an
+# ambiguous LunarLander is the one outcome the study cannot absorb. Needs Box2D, which
+# needs swig installed first (see the Makefile).
+id: LunarLander-v3
+kwargs: {}
+
+total_steps: 1_000_000
+eval_interval: 10_000
+eval_episodes: 10
+rollout_steps: 2_048
+
+signal_window: 20_000
+signal_stride: 10_000

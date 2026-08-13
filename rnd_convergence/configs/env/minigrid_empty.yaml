@@ -1,0 +1,16 @@
+# Rung 2, easy variant: (x, y, dir), 3-D discrete, dense enough to converge.
+#
+# This rung's job is to supply a well-defined t_conv on a discrete state space, so the
+# safest MiniGrid available is the right choice: Empty-5x5 has no key, no door and a
+# reward the agent reaches by wandering. minigrid_doorkey5 is the alternative if the
+# pilot shows Empty saturates too fast to resolve a plateau at all.
+id: MiniGrid-Empty-5x5-v0
+kwargs: {}
+
+total_steps: 300_000
+eval_interval: 5_000
+eval_episodes: 10
+rollout_steps: 2_048
+
+signal_window: 10_000
+signal_stride: 5_000

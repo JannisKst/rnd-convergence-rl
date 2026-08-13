@@ -1,3 +1,5 @@
+# Settings shared by every entry point. Experiment content lives in the configs that
+# compose this one (train.yaml and the env/ group).
 defaults:
   - _self_
   - override hydra/job_logging: colorlog
@@ -11,6 +13,4 @@ hydra:
   sweep:
     dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-env_id: CartPole-v1
 seed: 0
-n_episodes: 5

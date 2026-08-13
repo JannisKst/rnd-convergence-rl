@@ -219,10 +219,16 @@ def load_eval_curve(path: str | Path) -> EvalCurve:
         )
 
 
-def run_stem(env_id: str, seed: int) -> str:
+def run_stem(env_id: str, seed: int, tag: str | None = None) -> str:
     """Canonical file stem for a run, e.g. ``CartPole-v1__seed0``.
 
     Environment ids may contain characters awkward in filenames (MiniGrid ids contain
     ``-`` only, but this keeps the convention explicit and in one place).
+
+    ``tag`` names the experimental *condition* and is what keeps the frozen-policy control
+    from overwriting the trained run of the same environment and seed
+    (``CartPole-v1__frozen__seed0``). It is deliberately not folded into ``env_id``: the
+    ``env_id`` recorded inside the artefacts stays a real environment identifier, so
+    nothing downstream has to strip a suffix before rebuilding the environment.
     """
-    return f"{env_id}__seed{seed}"
+    return f"{env_id}__seed{seed}" if tag is None else f"{env_id}__{tag}__seed{seed}"

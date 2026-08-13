@@ -343,6 +343,7 @@ class PPOAgent:
         eval_episodes: int = 10,
         random_episodes: int = 20,
         env_id: str | None = None,
+        freeze_policy: bool = False,
     ) -> tuple[StateStream, EvalCurve]:
         """Train for ``total_steps`` environment steps and return the logged artefacts.
 
@@ -355,6 +356,17 @@ class PPOAgent:
 
         Per-update losses are accumulated on ``self.update_log`` for debugging; the two
         returned artefacts are what the offline analysis consumes.
+
+        ``freeze_policy=True`` collects and evaluates exactly as usual but never calls
+        :meth:`update`, which is the study's frozen-policy control. The RND predictor
+        accumulates gradient steps over whatever states it is shown, so its error decays
+        even under a policy that never improves; replaying this run's stream is what
+        separates "novelty is exhausted" from "the predictor has simply been training for
+        a while". Rollout actions are still *sampled* from the untrained policy, whose head
+        is initialised at gain 0.01 and is therefore near-uniform — so the logged stream is
+        the state distribution of an effectively random policy, which is what the control
+        needs. Update entries are still appended, with zero losses, so the diagnostic log
+        keeps a continuous step axis across both conditions.
         """
         env_id = env_id or getattr(self.env.spec, "id", type(self.env).__name__)
         random_return = self.random_policy_return(random_episodes)
@@ -368,7 +380,11 @@ class PPOAgent:
 
         while self.global_step < total_steps:
             rollout = self.collect_rollout(min(self.rollout_steps, total_steps - self.global_step))
-            losses = self.update(rollout)
+            losses = (
+                {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+                if freeze_policy
+                else self.update(rollout)
+            )
 
             # Keep the per-update diagnostics. A run in a job array that produces a
             # never-converging return curve is otherwise impossible to triage after the

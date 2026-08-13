@@ -265,6 +265,43 @@ class TestLearning:
         assert curve.returns.shape == (0, 3)
         assert convergence_report(curve).status == "not_learned"
 
+    def test_freeze_policy_leaves_the_networks_untouched(self):
+        # The frozen-policy control. It has to keep collecting and evaluating exactly as a
+        # normal run does -- the artefacts are the whole point of it -- while never taking
+        # a gradient step, so that the RND replay sees the state distribution of a policy
+        # that never improved.
+        trained = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
+        frozen = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
+        before = {
+            "policy": [p.detach().clone() for p in frozen.policy.parameters()],
+            "value": [p.detach().clone() for p in frozen.value_net.parameters()],
+        }
+
+        kwargs = {"eval_interval": 128, "eval_episodes": 2, "random_episodes": 2}
+        stream, curve = trained.train(512, **kwargs)
+        frozen_stream, frozen_curve = frozen.train(512, freeze_policy=True, **kwargs)
+
+        # The same run without the flag does move, so this is testing the flag and not an
+        # agent that happens not to learn in 512 steps.
+        assert any(
+            not np.allclose(a.numpy(), b.detach().numpy())
+            for a, b in zip(before["policy"], trained.policy.parameters())
+        )
+        assert all(
+            np.allclose(a.numpy(), b.detach().numpy())
+            for a, b in zip(before["policy"], frozen.policy.parameters())
+        )
+        assert all(
+            np.allclose(a.numpy(), b.detach().numpy())
+            for a, b in zip(before["value"], frozen.value_net.parameters())
+        )
+        # Same artefacts, same shapes: the control is analysed by the same code path.
+        assert frozen_stream.n_steps == stream.n_steps
+        assert frozen_curve.steps.shape == curve.steps.shape
+        # The diagnostic log keeps a continuous step axis across both conditions.
+        assert len(frozen.update_log) == len(trained.update_log)
+        assert all(entry["policy_loss"] == 0.0 for entry in frozen.update_log)
+
     def test_update_losses_are_retained_for_debugging(self):
         agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
         agent.train(256, eval_interval=128, eval_episodes=1, random_episodes=1)
