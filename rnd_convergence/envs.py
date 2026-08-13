@@ -18,15 +18,14 @@ for those rungs.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 import gymnasium as gym
 import minigrid  # noqa: F401  -- imported for its side effect of registering MiniGrid-* ids
 import numpy as np
-from gymnasium.spaces.utils import flatten
 
 from rnd_convergence.mars_rover import MarsRover
+from rnd_convergence.streams import StateFn, compact_state_fn
 
 MINIGRID_PREFIX = "MiniGrid-"
 MARS_ROVER_ID = "MarsRover"
@@ -62,42 +61,30 @@ class MiniGridStateWrapper(gym.ObservationWrapper):
         return np.array([x, y, inner.agent_dir], dtype=np.float32)
 
 
-def make_env(env_id: str, **kwargs: Any) -> gym.Env:
+def make_env(env_id: str, seed: int | None = None, **kwargs: Any) -> gym.Env:
     """Build a ladder environment with the wrappers that rung needs.
 
     ``"MarsRover"`` builds :class:`~rnd_convergence.mars_rover.MarsRover`, which has no
     Gymnasium id. MiniGrid ids get :class:`MiniGridStateWrapper`. Everything else is
     returned as ``gymnasium`` builds it.
+
+    ``seed`` seeds the action and observation spaces only. The environment itself is
+    seeded on the first ``reset(seed=...)``, which callers do themselves.
     """
-    if env_id == MARS_ROVER_ID:
-        return MarsRover(**kwargs)
-    env = gym.make(env_id, **kwargs)
+    env = MarsRover(**kwargs) if env_id == MARS_ROVER_ID else gym.make(env_id, **kwargs)
     if env_id.startswith(MINIGRID_PREFIX):
-        return MiniGridStateWrapper(env)
+        env = MiniGridStateWrapper(env)
+    if seed is not None:
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
     return env
 
 
-def state_fn_for(env: gym.Env) -> Callable[[Any], np.ndarray]:
-    """The ``state_fn`` to log for ``env``: its compact state, as a float vector.
+def state_fn_for(env: gym.Env) -> StateFn:
+    """The ``state_fn`` to log for ``env``.
 
-    A ``Discrete`` observation space is logged as the raw integer, *not* as the one-hot
-    vector the policy consumes. MarsRover is the case that matters: the ladder calls it
-    the 1-D rung, and one-hot encoding would make the entropy baseline see 5 dimensions.
-    The policy still receives the one-hot, which is the right input for a network.
-
-    For every other rung :func:`make_env` has already reduced the observation to the
-    compact state, so this is just a flatten and the two coincide.
+    A thin wrapper over :func:`~rnd_convergence.streams.compact_state_fn`, which is also
+    :class:`~rnd_convergence.ppo.PPOAgent`'s default — so passing this explicitly changes
+    nothing and exists only to make the choice visible at a call site.
     """
-    space = env.observation_space
-
-    if isinstance(space, gym.spaces.Discrete):
-
-        def discrete_state_fn(obs: Any) -> np.ndarray:
-            return np.asarray([obs], dtype=np.float32)
-
-        return discrete_state_fn
-
-    def state_fn(obs: Any) -> np.ndarray:
-        return np.asarray(flatten(space, obs), dtype=np.float32)
-
-    return state_fn
+    return compact_state_fn(env.observation_space)

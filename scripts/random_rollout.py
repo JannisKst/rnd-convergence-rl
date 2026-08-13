@@ -17,7 +17,8 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-from rnd_convergence.utils import make_env, set_seed
+from rnd_convergence.envs import make_env
+from rnd_convergence.utils import set_seed
 
 logger = logging.getLogger(__name__)
 

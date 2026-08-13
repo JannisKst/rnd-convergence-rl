@@ -97,19 +97,29 @@ class TestMarsRoverRung:
         assert state_fn_for(env)(obs)[0] == obs
 
     def test_policy_sees_the_one_hot_while_the_stream_logs_the_integer(self):
-        env = make_env("MarsRover")
-        agent = PPOAgent(
-            lambda: make_env("MarsRover"),
-            state_fn=state_fn_for(env),
-            rollout_steps=64,
-            seed=0,
-        )
+        # No state_fn passed: the DEFAULT has to be the compact state. Logging the
+        # one-hot here would silently make the 1-D anchor rung 5-D, and every other rung
+        # is read against it.
+        agent = PPOAgent(lambda: make_env("MarsRover"), rollout_steps=64, seed=0)
         assert agent.obs_dim == 5  # one-hot, the right input for a network
         assert agent.state_dim == 1  # the 1-D state the ladder claims
 
         stream, _ = agent.train(256, eval_interval=256, eval_episodes=2, random_episodes=2)
         assert stream.obs_dim == 1
         assert set(np.unique(stream.observations).tolist()) <= {0.0, 1.0, 2.0, 3.0, 4.0}
+
+    def test_explicit_state_fn_matches_the_default(self):
+        # state_fn_for is a convenience for making the choice visible at a call site; it
+        # must not be the only way to get the right one.
+        env = make_env("MarsRover")
+        explicit = PPOAgent(
+            lambda: make_env("MarsRover"), state_fn=state_fn_for(env), rollout_steps=32, seed=0
+        )
+        default = PPOAgent(lambda: make_env("MarsRover"), rollout_steps=32, seed=0)
+
+        assert explicit.state_dim == default.state_dim == 1
+        for observation in range(env.observation_space.n):
+            assert np.array_equal(explicit.state_fn(observation), default.state_fn(observation))
 
     def test_ladder_dimensions_match_the_readme_table(self):
         expected = {
@@ -124,3 +134,10 @@ class TestMarsRoverRung:
             env = make_env(env_id)
             obs, _ = env.reset(seed=0)
             assert state_fn_for(env)(obs).shape == (dim,), env_id
+            # And what an agent logs by default, which is what actually reaches disk.
+            assert PPOAgent(lambda i=env_id: make_env(i), seed=0).state_dim == dim, env_id
+
+    def test_make_env_seeds_spaces_when_asked(self):
+        # Folded in from the deleted utils.make_env, which could not build these rungs.
+        first = make_env("MarsRover", seed=3).action_space.sample()
+        assert first == make_env("MarsRover", seed=3).action_space.sample()

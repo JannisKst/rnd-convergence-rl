@@ -294,7 +294,7 @@ class TestMinimumCurveLength:
     def test_exactly_two_patience_points_is_allowed(self):
         values = np.concatenate([np.linspace(10.0, 1.0, 5), np.full(5, 1.0)])
         steps = np.arange(1, 11, dtype=np.int64) * 10_000
-        assert plateau_time(steps, values) is None or True  # must not raise
+        plateau_time(steps, values)  # must not raise
 
     def test_the_bound_follows_patience(self):
         steps = np.arange(1, 7, dtype=np.int64) * 10_000

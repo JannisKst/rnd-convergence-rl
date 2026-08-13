@@ -14,18 +14,54 @@ has to be computed inside the training loop. Training writes two artefacts per
     to normalise the convergence criterion.
 
 This module is the contract between the training half of the project and the offline
-analysis half; both sides depend on it and nothing else.
+analysis half. It also owns :func:`compact_state_fn`, the rule for what the logged state
+representation actually *is* — the two halves have to agree on that, and the ladder's
+dimensionality axis is only meaningful if they do.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import gymnasium as gym
 import numpy as np
+from gymnasium.spaces.utils import flatten
 
 STATE_STREAM_SUFFIX = ".states.npz"
 EVAL_CURVE_SUFFIX = ".evals.npz"
+
+StateFn = Callable[[Any], np.ndarray]
+
+
+def compact_state_fn(space: gym.Space) -> StateFn:
+    """The state representation to log for an environment with observation ``space``.
+
+    A ``Discrete`` space is logged as the raw integer, *not* as the one-hot vector a
+    network wants. MarsRover is why: the ladder calls it the 1-D anchor rung, and
+    one-hotting its 5 positions would make the entropy baseline see 5 dimensions and
+    quietly stop the control from being a control. Every other space is flattened, which
+    for the rungs :func:`~rnd_convergence.envs.make_env` builds is already the compact
+    state.
+
+    This lives here, next to :class:`StateStream`, because it defines what goes *into*
+    the stream — and because both the agent that writes it and the analysis that reads it
+    have to agree on it. It is :class:`~rnd_convergence.ppo.PPOAgent`'s default, so the
+    correct representation is what you get without opting in.
+    """
+    if isinstance(space, gym.spaces.Discrete):
+
+        def discrete_state_fn(obs: Any) -> np.ndarray:
+            return np.asarray([obs], dtype=np.float32)
+
+        return discrete_state_fn
+
+    def flat_state_fn(obs: Any) -> np.ndarray:
+        return np.asarray(flatten(space, obs), dtype=np.float32)
+
+    return flat_state_fn
 
 
 @dataclass(frozen=True)

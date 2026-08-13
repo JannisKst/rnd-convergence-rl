@@ -24,9 +24,7 @@ from gymnasium.spaces.utils import flatdim, flatten
 from torch import nn
 
 from rnd_convergence.networks import Policy, ValueNetwork
-from rnd_convergence.streams import EvalCurve, StateStream
-
-StateFn = Callable[[Any], np.ndarray]
+from rnd_convergence.streams import EvalCurve, StateFn, StateStream, compact_state_fn
 
 
 @dataclass
@@ -56,9 +54,11 @@ class PPOAgent:
         the training episode in progress.
     state_fn
         Maps a raw observation to the state representation written to the
-        :class:`~rnd_convergence.streams.StateStream`. Defaults to the flattened
-        observation. MiniGrid passes ``(x, y, dir)`` here instead, which is both the
-        exact state for the entropy baseline and far smaller on disk.
+        :class:`~rnd_convergence.streams.StateStream`. Defaults to
+        :func:`~rnd_convergence.streams.compact_state_fn`, which logs a ``Discrete``
+        observation as its integer and flattens everything else — the representation the
+        ladder's dimensionality axis is defined on. Override it only for an environment
+        whose compact state cannot be read off the observation.
     """
 
     def __init__(
@@ -105,7 +105,11 @@ class PPOAgent:
 
         self.obs_dim = flatdim(self.env.observation_space)
         self.n_actions = int(self.env.action_space.n)
-        self.state_fn = state_fn if state_fn is not None else self._flatten
+        # Not self._flatten: that one-hots a Discrete space, which is right for the
+        # network input and wrong for the logged state. See compact_state_fn.
+        self.state_fn = (
+            state_fn if state_fn is not None else compact_state_fn(self.env.observation_space)
+        )
 
         torch.manual_seed(seed)
         self.policy = Policy(self.obs_dim, self.n_actions, hidden_size, n_layers).to(self.device)

@@ -4,7 +4,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from rnd_convergence.utils import make_env, set_seed
+from rnd_convergence.envs import make_env
+from rnd_convergence.utils import set_seed
 
 
 def test_make_env_returns_env():

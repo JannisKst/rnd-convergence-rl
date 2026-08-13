@@ -1,10 +1,15 @@
-"""General utilities: seeding and environment construction."""
+"""General utilities: seeding.
+
+Environment construction lives in :mod:`rnd_convergence.envs`. This module used to carry
+its own ``make_env`` that only called ``gym.make``; two functions of the same name with
+different behaviour is a trap, and the plain one silently could not build the MarsRover or
+MiniGrid rungs.
+"""
 
 from __future__ import annotations
 
 import random
 
-import gymnasium as gym
 import numpy as np
 import torch
 
@@ -14,16 +19,3 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def make_env(env_id: str, seed: int | None = None, **env_kwargs) -> gym.Env:
-    """Create a Gymnasium environment with seeded spaces.
-
-    The environment itself is seeded on the first ``reset(seed=...)`` call,
-    which callers are expected to do themselves.
-    """
-    env = gym.make(env_id, **env_kwargs)
-    if seed is not None:
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-    return env
