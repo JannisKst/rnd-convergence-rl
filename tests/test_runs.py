@@ -36,7 +36,7 @@ GOOD = {
     "eval_interval": 2_000,
     "rollout_steps": 2_048,
     "signal_window": 5_000,
-    "signal_stride": 2_000,
+    "signal_stride": 2_500,
 }
 
 
@@ -51,7 +51,7 @@ def make_meta(**overrides):
         "eval_episodes": 10,
         "rollout_steps": 2_048,
         "signal_window": 5_000,
-        "signal_stride": 2_000,
+        "signal_stride": 2_500,
         "n_states": 200_000,
         "wall_clock_seconds": 123.5,
         "random_episodes": 20,
@@ -96,7 +96,7 @@ class TestCheckResolution:
     def test_accepts_a_well_sized_run_and_reports_the_point_counts(self):
         eval_points, signal_points = check_resolution(**GOOD)
         assert eval_points == 200_000 // 2_048
-        assert signal_points == 100
+        assert signal_points == 80
 
     def test_evaluation_spacing_is_bounded_below_by_the_rollout_length(self):
         # Asking for a grid finer than one rollout does not get one: evaluation can only
@@ -119,12 +119,32 @@ class TestCheckResolution:
 
     def test_rejects_too_few_signal_points(self):
         with pytest.raises(ValueError, match=f"below the {MIN_SIGNAL_POINTS} needed"):
-            check_resolution(**(GOOD | {"signal_stride": 20_000, "signal_window": 20_000}))
+            check_resolution(**(GOOD | {"signal_stride": 20_000, "signal_window": 40_000}))
+
+    def test_signal_points_are_counted_off_the_stride_so_they_cover_both_signals(self):
+        # Both curves are laid out by iter_windows, so the stride alone sets how many
+        # points either of them has. Widening the window changes what each point averages
+        # over, not how many there are -- and if this ever stops being true, the guard is
+        # verifying the SVE curve while the RND curve runs at some other resolution.
+        _, points = check_resolution(**GOOD)
+        assert points == 200_000 // GOOD["signal_stride"]
 
     def test_rejects_a_window_narrower_than_the_stride(self):
         # Consecutive windows would then leave gaps that no measurement ever covers.
         with pytest.raises(ValueError, match="narrower than"):
             check_resolution(**(GOOD | {"signal_window": 1_000}))
+
+    def test_rejects_an_overlap_the_rest_of_the_table_is_not_measured_at(self):
+        # The ratio reaches a run through the config, where `env.signal_stride=...` on the
+        # command line sails past every test that pins it -- so the guard has to hold it.
+        with pytest.raises(ValueError, match="must be 2x signal_stride"):
+            check_resolution(**(GOOD | {"signal_window": 20_000, "signal_stride": 2_500}))
+
+    def test_a_deliberate_overlap_sweep_can_opt_out(self):
+        assert check_resolution(**(GOOD | {"signal_window": 20_000}), window_stride_ratio=None) == (
+            200_000 // 2_048,
+            80,
+        )
 
     def test_rejects_nonsensical_settings(self):
         with pytest.raises(ValueError, match="must be >= 1"):
@@ -160,9 +180,16 @@ class TestShippedConfigs:
     def test_agent_config_matches_the_ppo_agent_signature(self):
         # train.py splats cfg.agent into PPOAgent. An unrecognised key is a TypeError at
         # the first environment step rather than at compose time, so pin the contract here.
+        #
+        # The subtracted names are the ones train.py already passes positionally or by
+        # keyword itself: putting seed or rollout_steps in the agent config would be
+        # accepted by a plain signature check and then die with "got multiple values for
+        # keyword argument" -- the same first-environment-step failure this test exists to
+        # move forward. state_fn is excluded because it is a callable no YAML can express.
         cfg = compose_rung(ENV_CONFIGS[0])
-        accepted = set(inspect.signature(PPOAgent.__init__).parameters) - {"self", "env_fn"}
-        assert set(cfg.agent) <= accepted, f"unknown agent keys: {set(cfg.agent) - accepted}"
+        passed_by_train_py = {"self", "env_fn", "seed", "rollout_steps", "state_fn"}
+        accepted = set(inspect.signature(PPOAgent.__init__).parameters) - passed_by_train_py
+        assert set(cfg.agent) <= accepted, f"unusable agent keys: {set(cfg.agent) - accepted}"
 
     @pytest.mark.parametrize("name", ENV_CONFIGS)
     def test_env_config_yields_enough_points_to_measure(self, name):

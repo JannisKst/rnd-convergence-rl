@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from rnd_convergence.streams import StateStream
+from rnd_convergence.windows import iter_windows
 
 
 class RunningNormalizer:
@@ -134,6 +135,7 @@ def streaming_rnd_error(
     lr: float = 1e-4,
     batch_size: int = 128,
     window: int = 5_000,
+    stride: int | None = None,
     seed: int = 0,
     device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -155,8 +157,11 @@ def streaming_rnd_error(
     batch_size
         Number of consecutive states per gradient step.
     window
-        Width, in environment steps, of the buckets the per-state errors are averaged
-        into. Determines the resolution of the returned curve.
+        Width, in environment steps, of the window the per-state errors are averaged
+        over. Sets how much data each curve point summarises.
+    stride
+        Spacing of curve points in environment steps; defaults to ``window``, which makes
+        consecutive windows adjacent and non-overlapping.
     seed
         Seeds target initialisation and predictor initialisation, so a replay is
         reproducible.
@@ -167,8 +172,16 @@ def streaming_rnd_error(
     -------
     steps, errors
         ``steps`` holds the upper edge of each window in environment steps; ``errors``
-        the mean squared prediction error of the states falling in it. Windows
-        containing no states are dropped.
+        the mean squared prediction error of the states falling in it.
+
+    The curve is laid out by :func:`~rnd_convergence.windows.iter_windows`, the same
+    function :func:`~rnd_convergence.entropy.entropy_curve` uses, so passing both the same
+    ``window`` and ``stride`` puts them on an identical step axis. That matters because the
+    study compares ``t_plateau`` between the two signals: measuring one on overlapping
+    windows and the other on disjoint buckets would put part of the difference between them
+    down to how each curve was built. Averaging per-state errors over a sliding window costs
+    nothing extra here --- unlike the entropy estimators, the expensive part (the replay)
+    has already happened by this point and does not depend on the grid.
     """
     if stream.n_steps == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
@@ -198,20 +211,7 @@ def streaming_rnd_error(
         squared_error.mean().backward()
         optimizer.step()
 
-    return _bucket_by_step(stream.steps, per_state_error, window)
-
-
-def _bucket_by_step(
-    steps: np.ndarray, values: np.ndarray, window: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Average ``values`` into fixed-width buckets of the environment-step axis.
-
-    Returns the upper edge of each non-empty bucket and the mean of the values in it.
-    """
-    if window < 1:
-        raise ValueError(f"window must be >= 1, got {window}")
-    bucket = steps // window
-    unique, inverse = np.unique(bucket, return_inverse=True)
-    sums = np.bincount(inverse, weights=values, minlength=unique.size)
-    counts = np.bincount(inverse, minlength=unique.size)
-    return (unique + 1) * window, sums / counts
+    grid = list(iter_windows(stream.steps, mode="sliding", window=window, stride=stride))
+    steps = np.asarray([point for point, _, _ in grid], dtype=np.int64)
+    errors = np.asarray([per_state_error[start:end].mean() for _, start, end in grid])
+    return steps, errors

@@ -15,6 +15,11 @@ what has to be said *about* a run and does not fit in either of them:
     ``t_conv`` is unresolvable, too few signal points and ``plateau_time`` cannot fire.
     Either way the result is a blank cell in the table discovered after the compute has
     been spent. This runs in milliseconds, before the first environment step.
+
+    It guards the window/stride ratio for the same reason. That ratio is a property of the
+    study rather than of a run --- it decides the time scale ``plateau_time`` responds to,
+    and ``Delta`` is compared across rungs and between signals --- but it reaches a run
+    through the config, where a CLI override sails straight past the tests that pin it.
 """
 
 from __future__ import annotations
@@ -42,6 +47,14 @@ MIN_SIGNAL_POINTS = 40
 # reference off the final `n_final`. Twenty points is the level below which t_conv is
 # quantised too coarsely for Delta to mean anything.
 MIN_EVAL_POINTS = 20
+
+# signal_window / signal_stride. plateau_time reads a plateau off the differences between
+# consecutive curve points, so the overlap between their windows is what decides how much
+# new data separates them --- it sets the time scale the detector responds to. Delta is
+# compared both across rungs and between RND and SVE, so the ratio has to be one number for
+# the whole study; which number matters far less than that it does not vary. Enforced here
+# rather than only in the configs because a CLI override reaches the run and not the tests.
+WINDOW_STRIDE_RATIO = 2
 
 
 @dataclass(frozen=True)
@@ -123,12 +136,21 @@ def check_resolution(
     signal_stride: int,
     min_eval_points: int = MIN_EVAL_POINTS,
     min_signal_points: int = MIN_SIGNAL_POINTS,
+    window_stride_ratio: int | None = WINDOW_STRIDE_RATIO,
 ) -> tuple[int, int]:
     """Verify a run will yield enough points to measure, and return how many of each.
 
-    Returns ``(eval_points, signal_points)``. Raises :class:`ValueError` with the setting
-    to change when either is too coarse, or when the sliding window is narrower than the
-    stride --- which would step the curve straight over states that were never measured.
+    Returns ``(eval_points, signal_points)``. Raises :class:`ValueError` naming the setting
+    to change when either count is too coarse, or when ``signal_window`` and
+    ``signal_stride`` are not in the ratio the whole study is measured at.
+
+    ``signal_points`` covers *both* monitoring signals. It is derived from the stride alone
+    because :func:`~rnd_convergence.windows.iter_windows` lays out one grid for the RND
+    error curve and the SVE curves alike, and the stride is what sets the number of points
+    on it. Pass ``window_stride_ratio=None`` to check a run measured at a deliberately
+    different overlap; nothing in the normal path does, since the analysis re-measures the
+    logged stream offline at whatever resolution a sensitivity sweep wants and does not
+    need the training run to have been sized differently.
 
     The evaluation spacing is ``max(eval_interval, rollout_steps)`` rather than
     ``eval_interval``: evaluation can only run on a rollout boundary, so asking for a grid
@@ -141,6 +163,15 @@ def check_resolution(
             f"signal_window ({signal_window}) is narrower than signal_stride "
             f"({signal_stride}), so consecutive windows would leave gaps of "
             f"{signal_stride - signal_window} steps that no measurement ever covers"
+        )
+    if window_stride_ratio is not None and signal_window != window_stride_ratio * signal_stride:
+        raise ValueError(
+            f"signal_window ({signal_window}) must be {window_stride_ratio}x signal_stride "
+            f"({signal_stride}), i.e. {window_stride_ratio * signal_stride}. The overlap "
+            "between consecutive windows sets the time scale plateau_time responds to, and "
+            "Delta is compared across rungs and between signals, so it has to be the same "
+            "everywhere; a run measured at a different ratio is not comparable to the rest "
+            "of the table"
         )
 
     eval_spacing = max(eval_interval, rollout_steps)

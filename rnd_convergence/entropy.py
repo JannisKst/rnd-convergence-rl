@@ -26,7 +26,7 @@ not just the plateau detector.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Literal
 
 import numpy as np
@@ -35,10 +35,19 @@ from scipy.special import digamma, gammaln
 
 from rnd_convergence.rnd import RunningNormalizer
 from rnd_convergence.streams import StateStream
+from rnd_convergence.windows import CurveMode, iter_windows
 
 Estimator = Literal["grid", "knn"]
-CurveMode = Literal["sliding", "cumulative"]
 Correction = Literal["none", "miller_madow"]
+
+__all__ = [
+    "CurveMode",
+    "entropy_curve",
+    "grid_entropy",
+    "grid_occupancy",
+    "knn_entropy",
+    "occupancy_curve",
+]
 
 _MAX_SAFE_CELLS = 2**62
 
@@ -258,9 +267,6 @@ def _windowed_curve(
     """Apply ``measure`` to each evaluation window of causally standardised observations."""
     if stream.n_steps == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-    stride = window if stride is None else stride
-    if stride < 1:
-        raise ValueError(f"stride must be >= 1, got {stride}")
 
     observations = stream.observations.astype(np.float64)
     normalizer = RunningNormalizer(stream.obs_dim)
@@ -268,7 +274,7 @@ def _windowed_curve(
     out_steps: list[int] = []
     out_values: list[float] = []
     fed = 0
-    for point, start, end in _iter_windows(stream.steps, mode=mode, window=window, stride=stride):
+    for point, start, end in iter_windows(stream.steps, mode=mode, window=window, stride=stride):
         # Fold in everything newly visible at this point, then standardise with those
         # statistics: causal, and the same update rule the RND replay uses.
         normalizer.update(observations[fed:end])
@@ -277,22 +283,3 @@ def _windowed_curve(
         out_values.append(measure(normalizer.normalize(observations[start:end], clip=None)))
 
     return np.asarray(out_steps, dtype=np.int64), np.asarray(out_values, dtype=np.float64)
-
-
-def _iter_windows(
-    steps: np.ndarray, *, mode: CurveMode, window: int, stride: int
-) -> Iterator[tuple[int, int, int]]:
-    """Yield ``(step, start, end)`` index slices for each evaluation point of the curve."""
-    if mode not in ("sliding", "cumulative"):
-        raise ValueError(f"unknown mode {mode!r}, expected 'sliding' or 'cumulative'")
-    last_step = int(steps[-1])
-    for point in range(stride, last_step + stride, stride):
-        end = int(np.searchsorted(steps, point, side="right"))
-        if end == 0:
-            continue
-        start = (
-            int(np.searchsorted(steps, point - window, side="right")) if mode == "sliding" else 0
-        )
-        if end - start < 2:
-            continue
-        yield point, start, end

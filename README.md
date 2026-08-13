@@ -124,11 +124,18 @@ defaults — because differencing costs one point and the leading `min_points �
 100k-step run measured at `window = 10_000` yields exactly 10 and can only ever answer at the final
 point; `plateau_time` raises rather than returning `None` below the bound, so this cannot be mistaken
 for "no plateau". Runs are therefore sized so that `total_steps / stride ≥ 40` — the *stride* sets
-the number of curve points, and the window sets how much data each one averages over. The two are
-held at `window = 2 × stride` on every rung: since `plateau_time` differences consecutive points,
-the overlap between windows determines how much new data separates them, and letting that vary by
-rung would fold the detector's effective time scale into the axis the table is comparing across.
-`check_resolution` enforces the point count before a run is launched.
+the number of curve points, and the window sets how much data each one averages over.
+
+The two are held at `window = 2 × stride` **on every rung and for every signal**. Since
+`plateau_time` differences consecutive points, the overlap between windows is what decides how much
+new data separates them, and therefore the time scale the detector responds to. `Δ` is compared in
+two directions at once — across rungs, and between RND and SVE in the same row — so an overlap that
+varied along either would fold the grid's own properties into the comparison. RND error and the SVE
+variants are estimated by completely different machinery (a single streaming replay against a
+re-run set-valued estimator), so this is not something the implementations give for free: both
+derive their points from one function, `windows.iter_windows`. `check_resolution` enforces the
+point count *and* the ratio before a run is launched, since both reach a run through the config,
+where a command-line override would otherwise sail past the tests that pin them.
 
 ### Reported quantities
 
@@ -193,7 +200,7 @@ control. Runs are independent and executed as a job array on the cluster.
 ```
 rnd_convergence/          Python package: agents, RND networks, convergence metrics
 rnd_convergence/configs/  Hydra configs (base + per-agent/per-env)
-scripts/                  Entry points for training runs and plotting
+scripts/                  Entry points: train.py (one run on one rung) and plotting
 tests/                    Unit tests
 docs/                     Proposal and report material
 ```
@@ -209,6 +216,33 @@ Requires Python 3.11 and [uv](https://docs.astral.sh/uv/).
 uv venv --python 3.11
 source .venv/bin/activate
 make install
+```
+
+## Running
+
+Training is the only expensive step; every signal and every detector setting is recomputed offline
+from the artefacts a run writes, so no run is ever repeated to try a different analysis.
+
+```bash
+python scripts/train.py env=cartpole seed=0            # one run on one rung
+python scripts/train.py -m env=cartpole seed=0,1,2,3,4 # one run per seed (the job-array form)
+python scripts/train.py env=cartpole frozen=true       # the frozen-policy control
+```
+
+Rungs are `marsrover`, `minigrid_empty`, `minigrid_doorkey5`, `minigrid_doorkey8`, `cartpole` and
+`lunarlander`; each carries both its training budget and the resolution its signal curves will be
+measured at, since the two are jointly constrained. `scripts/train.py` verifies that pairing before
+the first environment step and refuses to start a run whose `t_conv` or `t_plateau` could not be
+resolved — the failure being guarded against is a blank cell in the results table, discovered after
+the cluster time has been spent rather than before it.
+
+Four files per run land in `out_dir` (`results/` by default, or `$RND_RESULTS_DIR`):
+
+```
+<env>__[<tag>__]seed<n>.states.npz    visited-state stream, the input to every signal
+<env>__[<tag>__]seed<n>.evals.npz     evaluation-return curve plus the random-policy baseline
+<env>__[<tag>__]seed<n>.run.json      how the run was configured, and how long it took
+<env>__[<tag>__]seed<n>.updates.csv   per-update losses, for triaging a run that went wrong
 ```
 
 ## Development
