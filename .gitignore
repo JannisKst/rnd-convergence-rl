@@ -24,8 +24,8 @@ uv.lock
 /multirun/
 /results/
 /logs/
-wandb/
-runs/
+/wandb/
+/runs/
 
 # Model weights & large artifacts
 *.pt

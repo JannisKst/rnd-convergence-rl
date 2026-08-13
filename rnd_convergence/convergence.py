@@ -27,6 +27,16 @@ from rnd_convergence.streams import EvalCurve
 
 ConvergenceStatus = Literal["converged", "not_learned", "still_improving"]
 
+# Below this fraction of the signal's own magnitude, a point-to-point change is taken to be
+# arithmetic rather than signal. The test has to be relative rather than `> 0`: smoothing
+# runs through `np.cumsum`, which leaks rounding at the 1e-16 level, so an exact test would
+# call a genuinely constant curve constant at ``smooth_window=1`` and non-constant at 5 ---
+# and, worse, would key that verdict on whether the constant happens to be exactly
+# representable in binary (7.0 and 55.5 are, -60.607334 is not). Scaled by magnitude because
+# the signals differ by orders of magnitude: RND error runs around 1e-3 and differential
+# entropy around 1e1.
+_CONSTANT_RTOL = 1e-12
+
 
 @dataclass(frozen=True)
 class ConvergenceResult:
@@ -212,9 +222,18 @@ def plateau_time(
     a short trailing window and move erratically.
 
     Raises on a signal that never changes at all, rather than returning ``None``: a
-    constant signal has no rate to be slow relative to, and reporting it as "never
-    plateaued" would hide the saturated-grid case that
-    :func:`~rnd_convergence.entropy.grid_occupancy` exists to expose.
+    constant signal has no rate to be slow relative to, so "never plateaued" would file it
+    alongside signals that are genuinely still moving. "Never changes" means every
+    point-to-point change is under ``1e-12`` of the signal's own magnitude, which is a
+    statement about arithmetic, not a tolerance to tune.
+
+    Note what this does *not* catch. A fully saturated grid-SVE curve is pinned to
+    ``log N``, but ``N`` is the number of states in each window and that wobbles by a few
+    as episode boundaries move, so the curve is constant to about ``1e-4`` relative and
+    lands in the ordinary path rather than here. Saturation is diagnosed by
+    :func:`~rnd_convergence.entropy.grid_occupancy` sitting at 1.0, which is why that curve
+    is measured alongside every grid-SVE curve and carried into the results frame; do not
+    read the absence of this error as evidence that a grid estimate was informative.
 
     Raises, too, on a curve too short to resolve a plateau. The detector needs
     ``min_points + patience`` points — ``2 * patience``, i.e. 10, at the defaults —
@@ -256,10 +275,13 @@ def plateau_time(
         smoothed = np.log(smoothed)
 
     changes = np.abs(np.diff(smoothed))
-    if not np.any(changes > 0):
+    scale = float(np.max(np.abs(smoothed)))
+    if not np.any(changes > _CONSTANT_RTOL * (scale or 1.0)):
         raise ValueError(
             "signal is constant, so it has no rate of change to be measured against "
-            "(a grid-SVE curve pinned to log N does this: check grid_occupancy)"
+            f"(every change is under {_CONSTANT_RTOL:g} of the signal's own magnitude). "
+            "Note that a saturated grid-SVE curve is only nearly constant and does not "
+            "land here: check grid_occupancy for that"
         )
     reference = _running_quantile(changes, reference_quantile)
 

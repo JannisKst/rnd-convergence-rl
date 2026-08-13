@@ -209,13 +209,17 @@ control. Runs are independent and executed as a job array on the cluster.
 ```
 rnd_convergence/          Python package: agents, RND networks, convergence metrics
 rnd_convergence/configs/  Hydra configs (base + per-agent/per-env)
-scripts/                  Entry points: train.py (one run on one rung) and plotting
+scripts/                  Entry points: train.py (one run on one rung), analyze.py (runs -> frame)
 tests/                    Unit tests
 docs/                     Proposal and report material
+docs/results/             The committed frame and curves the report is written from
 ```
 
 Raw experiment outputs (`outputs/`, `results/`, model weights) are git-ignored; curated figures and
-aggregated metrics for the report are committed under `docs/`.
+aggregated metrics for the report are committed under `docs/`. That split is why `docs/results/` is
+committed rather than regenerated on demand: the state streams it was measured from are hundreds of
+megabytes and are not in the repository, so re-running `scripts/analyze.py` needs the training runs
+back first.
 
 ## Setup
 
@@ -253,6 +257,29 @@ Four files per run land in `out_dir` (`results/` by default, or `$RND_RESULTS_DI
 <env>__[<tag>__]seed<n>.run.json      how the run was configured, and how long it took
 <env>__[<tag>__]seed<n>.updates.csv   per-update losses, for triaging a run that went wrong
 ```
+
+### Analysis
+
+Everything downstream of training is one offline pass over that directory:
+
+```bash
+python scripts/analyze.py                       # results/ -> docs/results/
+python scripts/analyze.py --quick               # one detector setting, for a look at a pilot
+python scripts/analyze.py --seeds 0 1 2         # how much of Delta is the RND target draw
+```
+
+It writes `docs/results/signals.csv`, one row per `(run, signal, detector setting)`, and
+`docs/results/curves/<stem>.npz` holding every measured curve so the figures need no second replay.
+The detector sweep is *inside* the frame rather than beside it: `Delta` moves with `tau` and with
+both smoothing windows, so a frame that fixed them would report an answer with its uncertainty
+already discarded. `--bins`, `--clips` and `--seeds` widen the measurement sweep the same way, and
+each is a column, so any row can be traced back to the settings that produced it.
+
+Two columns need reading together with the rest. `conv_status` and `plateau_status` name the rows on
+which `t_conv` or `t_plateau` is undefined — and they are not missing at random, so every mean of
+`Delta` belongs next to those rates rather than quietly computed over what survived. And a grid-SVE
+plateau means nothing where `occupancy_max` is at 1.0: there the estimator is pinned to `log N` and
+the curve is arithmetic about sample counts, not evidence about exploration.
 
 ## Development
 

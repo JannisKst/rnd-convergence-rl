@@ -13,7 +13,7 @@ Two things here carry most of the weight.
 :func:`~rnd_convergence.convergence.plateau_time` deliberately *raises* on a curve too
 short to resolve a plateau and on a signal that never changes --- correct for a library,
 where returning ``None`` would make "no plateau" and "unmeasurable" indistinguishable, and
-fatal for a sweep, where one saturated SVE cell would take out the other 431 rows of the
+fatal for a sweep, where one unmeasurable SVE cell would take out the other 269 rows of the
 run. :func:`detect_plateau` maps each of those conditions to a *recorded status* instead.
 
 **Every failure mode has to survive into the frame.** ``t_conv`` is undefined for opposite
@@ -21,12 +21,21 @@ reasons on different rungs (``not_learned`` on DoorKey-8x8, ``still_improving`` 
 exhausted budget), and a signal can fail to plateau for three more. Dropping any of them
 biases each cell towards the seeds that happened to converge fastest, so they are counted
 and reported next to the means rather than filtered out here.
+
+One consequence of the first point is worth stating separately, because it is easy to read
+the frame the wrong way round. ``plateau_status == "constant_signal"`` fires only on a curve
+that is constant to within floating-point arithmetic. A *saturated* grid-SVE curve is not
+that: it is pinned to ``log N`` where ``N`` is the number of states per window, which wobbles
+by a few as episode boundaries move, so it varies by around ``1e-4`` relative and comes back
+as an ordinary ``plateau`` or ``no_plateau``. Saturation is read off ``occupancy_max``
+sitting at 1.0, which is why every grid-SVE row carries one; it is not read off
+``plateau_status``.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -93,11 +102,35 @@ DEFAULT_CONV_SMOOTH_WINDOWS: tuple[int, ...] = (1, 3, 5)
 
 DEFAULT_BIN_COUNTS: tuple[int, ...] = (5, 10, 20)
 
+# Standardised observations are clipped to [-clip, clip] before the grid is laid over them.
+# A sequence rather than a scalar because grid_entropy's docstring is explicit that this is
+# a sweep parameter and not a constant: the share of samples folded into the edge bins grows
+# with dimensionality, so a fixed clip lets clipping masquerade as the binning degradation
+# the study is trying to measure. It defaults to one value because on a ladder topping out
+# at 4-D nothing is near the edge --- the sweep is what LunarLander will need.
+DEFAULT_CLIPS: tuple[float, ...] = (5.0,)
+
+# Seeds for the two estimators that are not deterministic given the stream: the RND replay
+# (target and predictor initialisation) and the kNN subsample. Fixed at one seed everywhere
+# in the current results, which is a real limitation --- t_plateau for RND depends on which
+# random target was drawn, and with a single seed the frame cannot say how much of Delta is
+# that draw. Pass several to find out; the grid estimators are deterministic and are built
+# once regardless.
+DEFAULT_ANALYSIS_SEEDS: tuple[int, ...] = (0,)
+
 # Key the curve settings are stored under inside a saved curve archive.
 CURVE_MANIFEST = "__params__"
 
+# Columns that are step counts, i.e. integers that are legitimately absent. Held as pandas
+# nullable integers so that a missing t_conv does not silently turn the whole column to
+# float and write every step count to CSV as "20480.0".
+NULLABLE_INT_COLUMNS: tuple[str, ...] = ("t_conv", "t_plateau", "delta")
 
-@dataclass(frozen=True)
+
+# eq=False because the fields include numpy arrays, for which the generated __eq__ raises
+# on an ambiguous truth value and the generated __hash__ raises outright. Identity semantics
+# are what the call sites actually want; nothing here compares two curves for equality.
+@dataclass(frozen=True, eq=False)
 class Curve:
     """One monitoring signal measured over a run, with the settings that produced it.
 
@@ -106,6 +139,17 @@ class Curve:
     values because they become columns of the frame: the bin count in particular is an
     independent variable of the study rather than a hyperparameter, since the sweep over it
     is how discretization sensitivity is demonstrated.
+
+    The rule for what belongs here is that every setting which *moves the number* has to be
+    recoverable from the frame. That is why ``analysis_seed`` and ``rnd_overrides`` are
+    fields and not just arguments: two frames built with different RND learning rates, or
+    with different target-network draws, would otherwise be indistinguishable once written
+    to CSV. ``None`` for a setting means it does not apply to this estimator --- the grid
+    estimators are deterministic given the stream, so they carry no ``analysis_seed``.
+
+    ``rnd_overrides`` is JSON of the ``streaming_rnd_error`` arguments that were overridden,
+    empty when none were. It records the overrides rather than the effective values so that
+    the defaults live in that function's signature and nowhere else.
     """
 
     signal: str
@@ -115,15 +159,30 @@ class Curve:
     bins_per_dim: int | None = None
     clip: float | None = None
     k: int | None = None
+    max_samples: int | None = None
+    analysis_seed: int | None = None
+    rnd_overrides: str = ""
 
     @property
     def label(self) -> str:
-        """Stable short name, unique within a run's curve set."""
+        """Stable short name, unique within one :func:`build_curves` call.
+
+        Carries exactly the settings that are swept, so that two curves differing in any of
+        them cannot collide: bin count and clip for the grid estimators, ``k`` for kNN, and
+        the analysis seed for the two estimators whose value depends on it. Uniqueness is
+        scoped to one call because that is the set that lands in one archive and one legend;
+        concatenating the output of two calls that differ in something not swept here is not
+        a case this name is trying to survive.
+        """
         parts = [self.signal]
         if self.bins_per_dim is not None:
             parts.append(f"b{self.bins_per_dim}")
+        if self.clip is not None:
+            parts.append(f"c{self.clip:g}")
         if self.k is not None:
             parts.append(f"k{self.k}")
+        if self.analysis_seed is not None:
+            parts.append(f"s{self.analysis_seed}")
         parts.append(self.mode)
         return "_".join(parts)
 
@@ -140,14 +199,31 @@ class Curve:
 
     @property
     def params(self) -> dict[str, Any]:
-        """The identifying settings, as frame columns."""
+        """The identifying settings, as frame columns.
+
+        Also the round-trip format for :func:`save_curves`, so every key has to be a
+        constructor argument and JSON-representable.
+        """
         return {
             "signal": self.signal,
             "mode": self.mode,
             "bins_per_dim": self.bins_per_dim,
             "clip": self.clip,
             "k": self.k,
+            "max_samples": self.max_samples,
+            "analysis_seed": self.analysis_seed,
+            "rnd_overrides": self.rnd_overrides,
         }
+
+    @property
+    def grid_key(self) -> tuple[int | None, float | None, str]:
+        """What identifies the grid a discretizing curve was measured on.
+
+        Used to pair each grid-SVE curve with the occupancy curve that diagnoses it. It has
+        to include ``clip`` as well as the bin count: both are swept, and two curves at the
+        same bin count but different clips sit on genuinely different grids.
+        """
+        return (self.bins_per_dim, self.clip, self.mode)
 
 
 @dataclass(frozen=True)
@@ -209,11 +285,11 @@ def build_curves(
     window: int,
     stride: int,
     bin_counts: Sequence[int] = DEFAULT_BIN_COUNTS,
+    clips: Sequence[float] = DEFAULT_CLIPS,
     modes: Sequence[CurveMode] = ("sliding",),
-    clip: float = 5.0,
     knn_k: int = 4,
     knn_max_samples: int = 4_000,
-    seed: int = 0,
+    seeds: Sequence[int] = DEFAULT_ANALYSIS_SEEDS,
     rnd_kwargs: dict[str, Any] | None = None,
 ) -> list[Curve]:
     """Measure every monitoring signal over one logged run.
@@ -224,80 +300,95 @@ def build_curves(
     property of how the run was *sized*, and choosing a different stride afterwards moves
     every plateau.
 
-    The RND curve is built once and only in sliding mode --- see
+    The RND curve is built once per seed and only in sliding mode --- see
     :func:`~rnd_convergence.rnd.streaming_rnd_error` for why there is no cumulative variant
     --- while the SVE curves are built per requested mode. Note that a cumulative SVE curve
     lands on the same step axis as the sliding RND curve without being comparable to it;
     ``mode`` is carried into the frame so that comparison is never made by accident.
+
+    ``seeds`` is swept over the two estimators whose output depends on a random draw --- the
+    RND replay and the kNN subsample --- and not over the grid estimators, which are
+    deterministic given the stream and would otherwise be recomputed identically. Sweeping
+    it costs one full replay per seed, which is the expensive part of this function, so the
+    default is a single seed; several are what it takes to say how much of ``Delta`` is the
+    target-network draw rather than the agent.
     """
+    overrides = json.dumps(rnd_kwargs, sort_keys=True) if rnd_kwargs else ""
     curves = [
         Curve(
             signal="rnd",
+            analysis_seed=seed,
+            rnd_overrides=overrides,
             **_named_curve(
                 streaming_rnd_error(
                     stream, window=window, stride=stride, seed=seed, **(rnd_kwargs or {})
                 )
             ),
         )
+        for seed in seeds
     ]
     for mode in modes:
         for bins in bin_counts:
+            for clip in clips:
+                curves.append(
+                    Curve(
+                        signal="sve_grid",
+                        mode=mode,
+                        bins_per_dim=bins,
+                        clip=clip,
+                        **_named_curve(
+                            entropy_curve(
+                                stream,
+                                estimator="grid",
+                                mode=mode,
+                                window=window,
+                                stride=stride,
+                                bins_per_dim=bins,
+                                clip=clip,
+                            )
+                        ),
+                    )
+                )
+                curves.append(
+                    Curve(
+                        signal="occupancy",
+                        mode=mode,
+                        bins_per_dim=bins,
+                        clip=clip,
+                        **_named_curve(
+                            occupancy_curve(
+                                stream,
+                                mode=mode,
+                                window=window,
+                                stride=stride,
+                                bins_per_dim=bins,
+                                clip=clip,
+                            )
+                        ),
+                    )
+                )
+        for seed in seeds:
             curves.append(
                 Curve(
-                    signal="sve_grid",
+                    signal="sve_knn",
                     mode=mode,
-                    bins_per_dim=bins,
-                    clip=clip,
+                    k=knn_k,
+                    max_samples=knn_max_samples,
+                    analysis_seed=seed,
                     **_named_curve(
                         entropy_curve(
                             stream,
-                            estimator="grid",
+                            estimator="knn",
                             mode=mode,
                             window=window,
                             stride=stride,
-                            bins_per_dim=bins,
-                            clip=clip,
+                            k=knn_k,
+                            max_samples=knn_max_samples,
+                            seed=seed,
                         )
                     ),
                 )
             )
-            curves.append(
-                Curve(
-                    signal="occupancy",
-                    mode=mode,
-                    bins_per_dim=bins,
-                    clip=clip,
-                    **_named_curve(
-                        occupancy_curve(
-                            stream,
-                            mode=mode,
-                            window=window,
-                            stride=stride,
-                            bins_per_dim=bins,
-                            clip=clip,
-                        )
-                    ),
-                )
-            )
-        curves.append(
-            Curve(
-                signal="sve_knn",
-                mode=mode,
-                k=knn_k,
-                **_named_curve(
-                    entropy_curve(
-                        stream,
-                        estimator="knn",
-                        mode=mode,
-                        window=window,
-                        stride=stride,
-                        k=knn_k,
-                        max_samples=knn_max_samples,
-                        seed=seed,
-                    )
-                ),
-            )
-        )
     return curves
 
 
@@ -365,13 +456,21 @@ def analyse_run(
             "was sized for them and check_resolution verified them before it was launched. "
             "To measure at another resolution, call build_curves directly and pass curves="
         )
+    if curves is not None and curve_kwargs:
+        # Silently ignoring these would produce a frame whose columns say the sweep ran at
+        # settings it never saw.
+        raise TypeError(
+            f"curves= and build settings are mutually exclusive, got {sorted(curve_kwargs)} "
+            "alongside curves=. The passed curves were already built at their own settings; "
+            "drop one or the other"
+        )
     if curves is None:
         curves = build_curves(
             stream, window=meta.signal_window, stride=meta.signal_stride, **curve_kwargs
         )
     detectors = detector_grid() if detectors is None else detectors
 
-    occupancy = {(curve.bins_per_dim, curve.mode): curve for curve in curves if curve.is_diagnostic}
+    occupancy = {curve.grid_key: curve for curve in curves if curve.is_diagnostic}
     reports: dict[int, ConvergenceResult] = {}
     rows: list[dict[str, Any]] = []
 
@@ -398,7 +497,7 @@ def _row(
     t_plateau: int | None,
     status: PlateauStatus,
     eval_curve: EvalCurve,
-    occupancy: dict[tuple[int | None, str], Curve],
+    occupancy: dict[tuple[int | None, float | None, str], Curve],
 ) -> dict[str, Any]:
     """Assemble one frame row."""
     # Delta is excluded for the control by the `frozen` *flag*, never by its convergence
@@ -408,7 +507,7 @@ def _row(
     # meaningless Delta into the table on the one run whose job is to be a credibility
     # anchor.
     comparable = not meta.frozen
-    diagnostic = occupancy.get((curve.bins_per_dim, curve.mode)) if curve.bins_per_dim else None
+    diagnostic = occupancy.get(curve.grid_key) if curve.bins_per_dim is not None else None
 
     return {
         "env_id": meta.env_id,
@@ -442,7 +541,7 @@ def _row(
     }
 
 
-def _summarise(curve: Curve | None, reduce: Any) -> float | None:
+def _summarise(curve: Curve | None, reduce: Callable[[np.ndarray], Any]) -> float | None:
     if curve is None or curve.values.size == 0:
         return None
     return float(reduce(curve.values))
@@ -473,11 +572,16 @@ def load_run(stem: Path) -> tuple[StateStream, EvalCurve, RunMeta]:
     )
 
 
+RunStarted = Callable[[Path, RunMeta], None]
+RunFinished = Callable[[Path, RunMeta, list[dict[str, Any]], list[Curve]], None]
+
+
 def analyse_directory(
     directory: str | Path,
     *,
     detectors: Sequence[DetectorSpec] | None = None,
-    on_run: Any = None,
+    on_run_start: RunStarted | None = None,
+    on_run: RunFinished | None = None,
     **curve_kwargs: Any,
 ) -> tuple[pd.DataFrame, dict[str, list[Curve]]]:
     """Analyse every run in ``directory``.
@@ -486,15 +590,23 @@ def analyse_directory(
     what the figures are drawn from, and rebuilding them for plotting would repeat the
     expensive half of this function.
 
-    ``on_run`` is called with ``(stem, meta, rows)`` after each run, for progress
-    reporting; a directory of LunarLander runs takes minutes and silence is
-    indistinguishable from a hang.
+    Two callbacks rather than one, because the wait that needs explaining is *inside* a run,
+    not between runs: a single 500k-step DoorKey replay is minutes on its own, so a callback
+    that only fires on completion leaves exactly the silence it was meant to fill.
+    ``on_run_start`` is called with ``(stem, meta)`` before the curves are built and
+    ``on_run`` with ``(stem, meta, rows, curves)`` after.
+
+    ``on_run`` receives the curves as well as the rows so that a caller can persist each
+    run's archive as it lands. Everything is also accumulated and returned, but a batch that
+    dies on the last run should not throw away the replays of the ones before it.
     """
     rows: list[dict[str, Any]] = []
     curves_by_run: dict[str, list[Curve]] = {}
 
     for stem, meta in find_runs(directory):
-        stream, eval_curve, _ = load_run(stem)
+        if on_run_start is not None:
+            on_run_start(stem, meta)
+        stream, eval_curve, meta = load_run(stem)
         curves = build_curves(
             stream, window=meta.signal_window, stride=meta.signal_stride, **curve_kwargs
         )
@@ -502,9 +614,23 @@ def analyse_directory(
         curves_by_run[stem.name] = curves
         rows.extend(run_rows)
         if on_run is not None:
-            on_run(stem, meta, run_rows)
+            on_run(stem, meta, run_rows, curves)
 
-    return pd.DataFrame(rows), curves_by_run
+    return as_frame(rows), curves_by_run
+
+
+def as_frame(rows: Sequence[dict[str, Any]]) -> pd.DataFrame:
+    """Rows to frame, with the step-count columns held as nullable integers.
+
+    Without this, one ``None`` from a frozen control or a run that never converged makes
+    pandas widen the whole column to float, and ``t_conv`` reaches the report as
+    ``20480.0``. The values are step counts; they should read as step counts.
+    """
+    frame = pd.DataFrame(rows)
+    for column in NULLABLE_INT_COLUMNS:
+        if column in frame:
+            frame[column] = pd.array(frame[column], dtype="Int64")
+    return frame
 
 
 def save_curves(path: str | Path, curves: Sequence[Curve]) -> Path:

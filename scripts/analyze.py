@@ -3,6 +3,7 @@
     python scripts/analyze.py                          # results/ -> docs/results/
     python scripts/analyze.py --results /scratch/runs --out docs/results
     python scripts/analyze.py --modes sliding cumulative --quick
+    python scripts/analyze.py --seeds 0 1 2            # how much of Delta is the RND draw
 
 Writes two things to ``--out``:
 
@@ -11,7 +12,8 @@ Writes two things to ``--out``:
 
 Curves are saved because building them is the expensive half --- an RND replay plus a kNN
 estimate per window --- while sweeping detector settings over them is nearly free. Plotting
-later should read these rather than re-measure the streams.
+later should read these rather than re-measure the streams. Each archive is written as its
+run finishes, so a batch that dies partway leaves the runs before it on disk.
 
 This is argparse rather than Hydra, unlike ``scripts/train.py``. The Hydra configs describe
 an *experiment to run*, one composition per launch, and ``chdir: true`` moves the working
@@ -27,7 +29,11 @@ from pathlib import Path
 import pandas as pd
 
 from rnd_convergence.analysis import (
+    DEFAULT_ANALYSIS_SEEDS,
     DEFAULT_BIN_COUNTS,
+    DEFAULT_CLIPS,
+    Curve,
+    DetectorSpec,
     analyse_directory,
     detector_grid,
     find_runs,
@@ -56,31 +62,89 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--bins", nargs="+", type=int, default=list(DEFAULT_BIN_COUNTS), help="grid bin counts"
     )
     parser.add_argument(
+        "--clips",
+        nargs="+",
+        type=float,
+        default=list(DEFAULT_CLIPS),
+        help="standardised-observation clip bounds to lay the grid over",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=list(DEFAULT_ANALYSIS_SEEDS),
+        help="analysis seeds; sweeps the RND target draw and the kNN subsample, one replay each",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
-        help="one detector setting instead of the full sweep, for a fast look at a pilot",
+        help="a single detector setting instead of the full sweep, for a fast look at a pilot",
     )
     return parser.parse_args(argv)
 
 
+# The conv_smooth_window the digest prefers, and the one --quick pins. Not DetectorSpec's
+# default of 1: the MiniGrid rungs return an all-or-nothing greedy score, so an unsmoothed
+# eval curve puts t_conv wherever the last few coin flips landed and makes `retained` a
+# single-evaluation reading. The pilot frame shows what that costs -- retained ranges over
+# [-1.26, 4.39] at conv_smooth_window=1, which is noise, not non-monotonicity. The full
+# sweep still carries 1; it just is not what the console offers as the headline.
+DIGEST_CONV_SMOOTH = 3
+
+
+def digest_setting(frame: pd.DataFrame) -> dict[str, float | int]:
+    """The one detector setting the console digest is read at.
+
+    Three of the four come from :class:`DetectorSpec`'s own defaults rather than from the
+    data, so that the digest keeps meaning "the default setting" under a custom sweep
+    instead of silently re-defining itself as whatever happened to be swept.
+    """
+    default = DetectorSpec()
+    smoothed = sorted(w for w in frame.conv_smooth_window.unique() if w > 1)
+    return {
+        "tau": default.tau,
+        "smooth_window": default.smooth_window,
+        "reference_quantile": default.reference_quantile,
+        "conv_smooth_window": smoothed[0] if smoothed else frame.conv_smooth_window.min(),
+    }
+
+
 def summarise(frame: pd.DataFrame) -> str:
-    """A per-run, per-signal digest of the frame, at the default detector setting.
+    """A per-run, per-signal digest of the frame, at one detector setting.
 
     Printed because the first question asked of a pilot is whether each signal plateaued at
-    all, and scrolling a 400-row CSV to find out defeats the purpose of running one.
+    all, and scrolling a 400-row CSV to find out defeats the purpose of running one. The
+    setting is named in the header: this is one slice of a sweep, and a reader who takes the
+    printed `Delta` for *the* answer should at least be told which cell it came from.
     """
     if frame.empty:
         return "no rows"
-    defaults = frame[
-        (frame.tau == frame.tau.min())
-        & (frame.smooth_window == 5)
-        & (frame.reference_quantile == 0.5)
-        & (frame.conv_smooth_window == frame.conv_smooth_window.min())
-    ]
-    view = defaults if not defaults.empty else frame
+    setting = digest_setting(frame)
+    selected = frame
+    for column, value in setting.items():
+        selected = selected[selected[column] == value]
+
+    header = ", ".join(f"{column}={value}" for column, value in setting.items())
+    if selected.empty:
+        return f"no rows at {header}; showing the whole frame\n" + _table(frame)
+    return f"at {header}:\n" + _table(selected)
+
+
+def _table(frame: pd.DataFrame) -> str:
     columns = ["env_id", "seed", "frozen", "label", "n_points", "t_conv", "conv_status"]
     columns += ["t_plateau", "plateau_status", "delta", "retained", "occupancy_max"]
-    return view[columns].to_string(index=False, max_colwidth=24)
+    return frame[columns].to_string(index=False, max_colwidth=24)
+
+
+def quick_grid() -> list[DetectorSpec]:
+    """One detector setting: the digest's, so --quick prints the frame it just built."""
+    default = DetectorSpec()
+    return detector_grid(
+        taus=(default.tau,),
+        smooth_windows=(default.smooth_window,),
+        reference_quantiles=(default.reference_quantile,),
+        conv_smooth_windows=(DIGEST_CONV_SMOOTH,),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,24 +155,33 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"analysing {len(runs)} run(s) from {args.results}")
-    detectors = detector_grid(taus=(0.1,), smooth_windows=(5,)) if args.quick else detector_grid()
+    detectors = quick_grid() if args.quick else detector_grid()
+    args.out.mkdir(parents=True, exist_ok=True)
 
-    def report(stem: Path, meta: RunMeta, rows: list[dict]) -> None:
-        print(f"  {stem.name}: {meta.n_states} states -> {len(rows)} rows")
+    def starting(stem: Path, meta: RunMeta) -> None:
+        # Before the build, not after: the replay is where the minutes go, and a line that
+        # only appears once it is over is a line that appears once the waiting is done.
+        print(f"  {stem.name}: replaying {meta.n_states} states ...", flush=True)
+
+    def finished(stem: Path, meta: RunMeta, rows: list[dict], curves: list[Curve]) -> None:
+        # Written per run rather than after the batch so that a failure on the last run
+        # does not discard the replays of every run before it.
+        path = save_curves(args.out / "curves" / f"{stem.name}.npz", curves)
+        print(f"    {len(rows)} rows, {len(curves)} curves -> {path.name}", flush=True)
 
     frame, curves_by_run = analyse_directory(
         args.results,
         detectors=detectors,
         modes=args.modes,
         bin_counts=args.bins,
-        on_run=report,
+        clips=args.clips,
+        seeds=args.seeds,
+        on_run_start=starting,
+        on_run=finished,
     )
 
-    args.out.mkdir(parents=True, exist_ok=True)
     frame_path = args.out / "signals.csv"
     frame.to_csv(frame_path, index=False)
-    for name, curves in curves_by_run.items():
-        save_curves(args.out / "curves" / f"{name}.npz", curves)
 
     print(f"\n{summarise(frame)}\n")
     # The statuses are exactly the rows a mean of Delta silently drops, and they are not

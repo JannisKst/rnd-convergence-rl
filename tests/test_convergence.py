@@ -115,12 +115,36 @@ class TestPlateauTime:
     def test_constant_signal_raises_rather_than_returning_none(self):
         # A signal that never varied gives no scale to be flat relative to. Returning
         # None would file it under "never plateaued" alongside genuinely still-moving
-        # signals; a saturated grid-SVE curve pinned to log N lands here, and that is a
-        # fact about the estimator running out of samples, not about exploration.
+        # signals, which is a different fact about the run.
         n = 30
         values = np.full(n, 7.0)
         with pytest.raises(ValueError, match="constant"):
             plateau_time(self.steps_for(n), values, tau=0.02, patience=5)
+
+    @pytest.mark.parametrize("constant", [7.0, 55.5, 1e6, -60.607334, 3.7, 0.1, -0.30103])
+    @pytest.mark.parametrize("smooth_window", [1, 5, 9])
+    def test_constancy_is_decided_by_the_data_not_by_floating_point(self, constant, smooth_window):
+        # trailing_mean sums through np.cumsum, so smoothing a constant curve leaves
+        # residues around 1e-14 -- but only for constants that are not exactly
+        # representable in binary. Under a `> 0` test that made the verdict depend on the
+        # bit pattern of the constant: 7.0 and 55.5 raised at every smoothing window while
+        # -60.607334 and 3.7 raised only at smooth_window=1 and returned None above it.
+        # The same curve has to get the same answer whichever way it is smoothed.
+        n = 30
+        values = np.full(n, constant)
+        with pytest.raises(ValueError, match="constant"):
+            plateau_time(self.steps_for(n), values, tau=0.02, smooth_window=smooth_window)
+
+    def test_a_signal_that_really_moves_a_little_is_not_called_constant(self):
+        # The guard must not swallow small-but-real movement. A saturated grid-SVE curve
+        # is the case in point: pinned to log N, where N wobbles by a few states per
+        # window, so it varies by ~1e-4 relative. That is far above the arithmetic floor
+        # and must reach the detector; grid_occupancy is what identifies it as saturated.
+        rng = np.random.default_rng(0)
+        n = 80
+        values = np.log(5_000 + rng.integers(-3, 4, n).astype(np.float64))
+        assert values.max() - values.min() > 0
+        plateau_time(self.steps_for(n), values, tau=0.02)  # must not raise
 
     def test_noise_around_a_flat_level_still_plateaus(self):
         rng = np.random.default_rng(0)
