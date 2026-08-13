@@ -27,6 +27,14 @@ from rnd_convergence.streams import EvalCurve
 
 ConvergenceStatus = Literal["converged", "not_learned", "still_improving"]
 
+RetainedStatus = Literal[
+    "retained",
+    "no_stop_time",
+    "empty_curve",
+    "no_improvement",
+    "before_first_eval",
+]
+
 # Below this fraction of the signal's own magnitude, a point-to-point change is taken to be
 # arithmetic rather than signal. The test has to be relative rather than `> 0`: smoothing
 # runs through `np.cumsum`, which leaks rounding at the 1e-16 level, so an exact test would
@@ -88,6 +96,22 @@ def _first_sustained(flags: np.ndarray, patience: int) -> int | None:
     return int(candidates[0])
 
 
+def _reference_return(curve: EvalCurve, n_final: int) -> float:
+    """``R_ref``: what the run ended up scoring, as the mean of its last ``n_final`` evals.
+
+    Read off the *raw* curve, never a smoothed one. ``R_ref`` sets both the convergence
+    threshold and the denominator of :func:`retained_performance`, so it has to be a
+    property of the run; smoothing decides *when* the curve crossed the threshold, not what
+    it converged to. Running it through :func:`trailing_mean` first would silently widen
+    this average to ``n_final + smooth_window - 1`` points with triangular weights, and on a
+    noisy curve that moves the answer: on the MiniGrid-Empty pilot, seed 4 reported
+    ``R_ref = 0.382`` unsmoothed and ``0.191`` at ``smooth_window=3``, which is below its
+    own random baseline of 0.213 --- the same run coming back ``converged`` or
+    ``not_learned`` depending on a detector setting that was only supposed to denoise it.
+    """
+    return float(np.mean(curve.mean_returns[-n_final:]))
+
+
 def _running_quantile(values: np.ndarray, q: float) -> np.ndarray:
     """Element ``i`` is the ``q``-quantile of ``values[: i + 1]``.
 
@@ -114,6 +138,10 @@ def convergence_time(
     ``R_0 + frac * (R_ref - R_0)`` and stays there for ``patience`` consecutive
     evaluations, where ``R_ref`` is the mean of the final ``n_final`` evaluations and
     ``R_0`` the random-policy return recorded with the run.
+
+    ``smooth_window`` smooths only the curve the crossing is read from. ``R_ref``, and with
+    it the threshold, comes off the raw returns whatever the smoothing --- see
+    :func:`_reference_return` for why that separation is load-bearing.
 
     Anchoring on the random-policy baseline rather than on a percentage of the final
     value keeps the criterion meaningful for negative returns (Pendulum-like) and for
@@ -148,17 +176,17 @@ def convergence_report(
     """
     if not 0.0 < frac <= 1.0:
         raise ValueError(f"frac must be in (0, 1], got {frac}")
-    returns = trailing_mean(curve.mean_returns, smooth_window)
+    returns = curve.mean_returns
     if returns.size == 0:
         return ConvergenceResult(None, "not_learned", float("nan"), float("nan"))
 
-    reference = float(np.mean(returns[-n_final:]))
+    reference = _reference_return(curve, n_final)
     improvement = reference - curve.random_return
     if improvement <= min_improvement:
         return ConvergenceResult(None, "not_learned", reference, improvement)
 
     threshold = curve.random_return + frac * improvement
-    index = _first_sustained(returns >= threshold, patience)
+    index = _first_sustained(trailing_mean(returns, smooth_window) >= threshold, patience)
     if index is None:
         # The agent learned, but never held above the threshold for `patience`
         # evaluations. On a curve still rising at the end of the run the threshold sits
@@ -302,6 +330,47 @@ def signal_lag(t_plateau: int | None, t_conv: int | None) -> int | None:
     return int(t_plateau - t_conv)
 
 
+@dataclass(frozen=True)
+class RetainedResult:
+    """``retained`` together with *why* it is what it is.
+
+    Same reasoning as :class:`ConvergenceResult`. ``retained is None`` has four causes and
+    they are not the same finding: a signal that never plateaued (``no_stop_time``), a run
+    that never beat random so there is no performance to retain a fraction *of*
+    (``no_improvement``), and a plateau detected before the first evaluation ever ran
+    (``before_first_eval``) say different things about the row. Pooling them into a blank
+    cell hides the last one in particular, which is the one that would mean the stopping
+    rule fired before there was any performance to measure it against.
+    """
+
+    retained: float | None
+    status: RetainedStatus
+
+
+def retained_report(
+    curve: EvalCurve,
+    t_stop: int | None,
+    *,
+    n_final: int = 5,
+    smooth_window: int = 1,
+) -> RetainedResult:
+    """:func:`retained_performance` plus the diagnosis of why it is or is not defined."""
+    if curve.steps.size == 0:
+        return RetainedResult(None, "empty_curve")
+    if t_stop is None:
+        return RetainedResult(None, "no_stop_time")
+
+    improvement = _reference_return(curve, n_final) - curve.random_return
+    if improvement <= 0:
+        return RetainedResult(None, "no_improvement")
+    index = int(np.searchsorted(curve.steps, t_stop, side="right")) - 1
+    if index < 0:
+        return RetainedResult(None, "before_first_eval")
+
+    returns = trailing_mean(curve.mean_returns, smooth_window)
+    return RetainedResult(float((returns[index] - curve.random_return) / improvement), "retained")
+
+
 def retained_performance(
     curve: EvalCurve,
     t_stop: int | None,
@@ -317,16 +386,11 @@ def retained_performance(
 
     ``smooth_window`` must match the one passed to :func:`convergence_time`: this number
     and ``t_conv`` are reported in the same table row, and reading them off differently
-    smoothed versions of the same curve makes them quietly incomparable.
+    smoothed versions of the same curve makes them quietly incomparable. As there, it
+    smooths only the point being read off; the denominator is ``R_ref - R_0`` from the raw
+    curve, so the scale this fraction is measured on does not move with it.
+
+    Returns ``None`` for four different reasons; use :func:`retained_report` to tell them
+    apart, exactly as :func:`convergence_report` does for ``t_conv``.
     """
-    if t_stop is None or curve.steps.size == 0:
-        return None
-    returns = trailing_mean(curve.mean_returns, smooth_window)
-    reference = float(np.mean(returns[-n_final:]))
-    improvement = reference - curve.random_return
-    if improvement <= 0:
-        return None
-    index = int(np.searchsorted(curve.steps, t_stop, side="right")) - 1
-    if index < 0:
-        return None
-    return float((returns[index] - curve.random_return) / improvement)
+    return retained_report(curve, t_stop, n_final=n_final, smooth_window=smooth_window).retained

@@ -27,9 +27,9 @@ the frame the wrong way round. ``plateau_status == "constant_signal"`` fires onl
 that is constant to within floating-point arithmetic. A *saturated* grid-SVE curve is not
 that: it is pinned to ``log N`` where ``N`` is the number of states per window, which wobbles
 by a few as episode boundaries move, so it varies by around ``1e-4`` relative and comes back
-as an ordinary ``plateau`` or ``no_plateau``. Saturation is read off ``occupancy_max``
+as an ordinary ``plateau`` or ``no_plateau``. Saturation is read off ``occupancy_at_plateau``
 sitting at 1.0, which is why every grid-SVE row carries one; it is not read off
-``plateau_status``.
+``plateau_status``, and not off ``occupancy_max`` either --- see :func:`_row`.
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ from rnd_convergence.convergence import (
     ConvergenceResult,
     convergence_report,
     plateau_time,
-    retained_performance,
+    retained_report,
     signal_lag,
 )
-from rnd_convergence.entropy import entropy_curve, occupancy_curve
+from rnd_convergence.entropy import Correction, entropy_curve, occupancy_curve
 from rnd_convergence.rnd import streaming_rnd_error
 from rnd_convergence.runs import RUN_META_SUFFIX, RunMeta, load_run_meta
 from rnd_convergence.streams import (
@@ -61,7 +61,7 @@ from rnd_convergence.streams import (
     load_eval_curve,
     load_state_stream,
 )
-from rnd_convergence.windows import CurveMode
+from rnd_convergence.windows import CurveMode, iter_windows
 
 PlateauStatus = Literal[
     "plateau",
@@ -118,6 +118,13 @@ DEFAULT_CLIPS: tuple[float, ...] = (5.0,)
 # once regardless.
 DEFAULT_ANALYSIS_SEEDS: tuple[int, ...] = (0,)
 
+# Bias corrections for the grid estimator. Miller-Madow compensates the plug-in estimator's
+# downward bias when cells are undersampled, which is the regime the top of the ladder lives
+# in, so the README offers it as a sensitivity check --- and a sensitivity check that no
+# entry point can reach is not one. It is a sweep axis rather than a flag because the
+# comparison being made is plug-in against corrected, on the same curve.
+DEFAULT_CORRECTIONS: tuple[Correction, ...] = ("none",)
+
 # Key the curve settings are stored under inside a saved curve archive.
 CURVE_MANIFEST = "__params__"
 
@@ -158,6 +165,7 @@ class Curve:
     mode: CurveMode = "sliding"
     bins_per_dim: int | None = None
     clip: float | None = None
+    correction: Correction | None = None
     k: int | None = None
     max_samples: int | None = None
     analysis_seed: int | None = None
@@ -179,6 +187,8 @@ class Curve:
             parts.append(f"b{self.bins_per_dim}")
         if self.clip is not None:
             parts.append(f"c{self.clip:g}")
+        if self.correction not in (None, "none"):
+            parts.append("mm")
         if self.k is not None:
             parts.append(f"k{self.k}")
         if self.analysis_seed is not None:
@@ -209,6 +219,7 @@ class Curve:
             "mode": self.mode,
             "bins_per_dim": self.bins_per_dim,
             "clip": self.clip,
+            "correction": self.correction,
             "k": self.k,
             "max_samples": self.max_samples,
             "analysis_seed": self.analysis_seed,
@@ -221,7 +232,9 @@ class Curve:
 
         Used to pair each grid-SVE curve with the occupancy curve that diagnoses it. It has
         to include ``clip`` as well as the bin count: both are swept, and two curves at the
-        same bin count but different clips sit on genuinely different grids.
+        same bin count but different clips sit on genuinely different grids. ``correction``
+        is deliberately *not* part of it --- a bias correction changes the entropy estimate,
+        not which cells were occupied, so both corrections share one occupancy curve.
         """
         return (self.bins_per_dim, self.clip, self.mode)
 
@@ -262,6 +275,17 @@ class DetectorSpec:
             "conv_smooth_window": self.conv_smooth_window,
         }
 
+    @property
+    def plateau_key(self) -> tuple[float, int, float]:
+        """The settings ``plateau_time`` actually reads.
+
+        ``conv_smooth_window`` is not among them --- it belongs to the evaluation curve, not
+        to the signal --- so every ``t_plateau`` is shared by the specs that differ only in
+        it. :func:`analyse_run` caches on this, the same way it caches
+        ``convergence_report`` on ``conv_smooth_window`` alone.
+        """
+        return (self.tau, self.smooth_window, self.reference_quantile)
+
 
 def detector_grid(
     taus: Sequence[float] = DEFAULT_TAUS,
@@ -286,6 +310,7 @@ def build_curves(
     stride: int,
     bin_counts: Sequence[int] = DEFAULT_BIN_COUNTS,
     clips: Sequence[float] = DEFAULT_CLIPS,
+    corrections: Sequence[Correction] = DEFAULT_CORRECTIONS,
     modes: Sequence[CurveMode] = ("sliding",),
     knn_k: int = 4,
     knn_max_samples: int = 4_000,
@@ -306,12 +331,21 @@ def build_curves(
     lands on the same step axis as the sliding RND curve without being comparable to it;
     ``mode`` is carried into the frame so that comparison is never made by accident.
 
-    ``seeds`` is swept over the two estimators whose output depends on a random draw --- the
-    RND replay and the kNN subsample --- and not over the grid estimators, which are
-    deterministic given the stream and would otherwise be recomputed identically. Sweeping
-    it costs one full replay per seed, which is the expensive part of this function, so the
-    default is a single seed; several are what it takes to say how much of ``Delta`` is the
-    target-network draw rather than the agent.
+    ``seeds`` is swept over the estimators whose output depends on a random draw --- the RND
+    replay always, and the kNN estimate only where it actually subsamples --- and never over
+    the grid estimators, which are deterministic given the stream and would otherwise be
+    recomputed identically. Sweeping it costs one full replay per seed, which is the
+    expensive part of this function, so the default is a single seed; several are what it
+    takes to say how much of ``Delta`` is the target-network draw rather than the agent.
+
+    The kNN qualification matters more than it sounds. :func:`~rnd_convergence.entropy.
+    knn_entropy` only draws a subsample when a window holds more than ``knn_max_samples``
+    states, so on a rung whose ``signal_window`` is at or below that --- MarsRover measures
+    at 1000 --- the curve is identical for every seed. Emitting one row per seed there would
+    write exact duplicates, and any spread-over-seeds statistic computed from them would
+    report a variance of zero: "this estimator is stable" when the truth is "the sweep never
+    applied". Those curves are marked ``analysis_seed=None`` instead, the same way the grid
+    estimators are.
     """
     overrides = json.dumps(rnd_kwargs, sort_keys=True) if rnd_kwargs else ""
     curves = [
@@ -330,25 +364,30 @@ def build_curves(
     for mode in modes:
         for bins in bin_counts:
             for clip in clips:
-                curves.append(
-                    Curve(
-                        signal="sve_grid",
-                        mode=mode,
-                        bins_per_dim=bins,
-                        clip=clip,
-                        **_named_curve(
-                            entropy_curve(
-                                stream,
-                                estimator="grid",
-                                mode=mode,
-                                window=window,
-                                stride=stride,
-                                bins_per_dim=bins,
-                                clip=clip,
-                            )
-                        ),
+                for correction in corrections:
+                    curves.append(
+                        Curve(
+                            signal="sve_grid",
+                            mode=mode,
+                            bins_per_dim=bins,
+                            clip=clip,
+                            correction=correction,
+                            **_named_curve(
+                                entropy_curve(
+                                    stream,
+                                    estimator="grid",
+                                    mode=mode,
+                                    window=window,
+                                    stride=stride,
+                                    bins_per_dim=bins,
+                                    clip=clip,
+                                    correction=correction,
+                                )
+                            ),
+                        )
                     )
-                )
+                # One occupancy curve per grid, not per correction: a bias correction moves
+                # the entropy estimate, not which cells the states landed in.
                 curves.append(
                     Curve(
                         signal="occupancy",
@@ -367,7 +406,15 @@ def build_curves(
                         ),
                     )
                 )
-        for seed in seeds:
+        knn_seeds = _knn_seeds(
+            stream,
+            mode=mode,
+            window=window,
+            stride=stride,
+            max_samples=knn_max_samples,
+            seeds=seeds,
+        )
+        for seed in knn_seeds:
             curves.append(
                 Curve(
                     signal="sve_knn",
@@ -384,12 +431,36 @@ def build_curves(
                             stride=stride,
                             k=knn_k,
                             max_samples=knn_max_samples,
-                            seed=seed,
+                            seed=seeds[0] if seed is None else seed,
                         )
                     ),
                 )
             )
     return curves
+
+
+def _knn_seeds(
+    stream: StateStream,
+    *,
+    mode: CurveMode,
+    window: int,
+    stride: int,
+    max_samples: int,
+    seeds: Sequence[int],
+) -> tuple[int | None, ...]:
+    """The seeds worth building a kNN curve at, or ``(None,)`` when the estimate is exact.
+
+    ``knn_entropy`` subsamples only when a window holds more than ``max_samples`` states, so
+    the question is whether any window on this grid does. Answered from the window layout
+    rather than from ``window <= max_samples``, because the two differ: cumulative windows
+    grow past any fixed width, and a stream logged at less than one state per environment
+    step holds fewer states than its width suggests.
+    """
+    subsamples = any(
+        end - start > max_samples
+        for _, start, end in iter_windows(stream.steps, mode=mode, window=window, stride=stride)
+    )
+    return tuple(seeds) if subsamples else (None,)
 
 
 def _named_curve(curve: tuple[np.ndarray, np.ndarray]) -> dict[str, np.ndarray]:
@@ -428,6 +499,24 @@ def detect_plateau(curve: Curve, spec: DetectorSpec) -> tuple[int | None, Platea
     return (None, "no_plateau") if t_plateau is None else (t_plateau, "plateau")
 
 
+def _reject_resolution_overrides(curve_kwargs: dict[str, Any]) -> None:
+    """Refuse ``window``/``stride`` from a caller that has a ``RunMeta`` to hand.
+
+    Shared by :func:`analyse_run` and :func:`analyse_directory` so that the same mistake
+    gets the same explanation. Without it the directory-level call reaches ``build_curves``
+    and fails with "got multiple values for keyword argument 'window'", which says nothing
+    about why passing one was wrong.
+    """
+    overrides = set(curve_kwargs) & {"window", "stride"}
+    if overrides:
+        raise TypeError(
+            f"{', '.join(sorted(overrides))} come from the run's RunMeta, not from the "
+            "caller: the run was sized for them and check_resolution verified them before "
+            "it was launched. To measure at another resolution, call build_curves directly "
+            "and pass curves="
+        )
+
+
 def analyse_run(
     stream: StateStream,
     eval_curve: EvalCurve,
@@ -450,12 +539,7 @@ def analyse_run(
     nothing to do with its signal. Build the curves yourself and pass them in if that is
     genuinely what you want.
     """
-    if set(curve_kwargs) & {"window", "stride"}:
-        raise TypeError(
-            "window and stride come from the run's RunMeta, not from the caller: the run "
-            "was sized for them and check_resolution verified them before it was launched. "
-            "To measure at another resolution, call build_curves directly and pass curves="
-        )
+    _reject_resolution_overrides(curve_kwargs)
     if curves is not None and curve_kwargs:
         # Silently ignoring these would produce a frame whose columns say the sweep ran at
         # settings it never saw.
@@ -472,6 +556,10 @@ def analyse_run(
 
     occupancy = {curve.grid_key: curve for curve in curves if curve.is_diagnostic}
     reports: dict[int, ConvergenceResult] = {}
+    # Both detectors are cached on the axis they actually depend on. t_conv varies only with
+    # conv_smooth_window, and t_plateau only with the other three, so the full cross-product
+    # of specs asks each question three times over.
+    plateaus: dict[tuple[int, tuple[float, int, float]], tuple[int | None, PlateauStatus]] = {}
     rows: list[dict[str, Any]] = []
 
     for spec in detectors:
@@ -481,10 +569,13 @@ def analyse_run(
             )
         report = reports[spec.conv_smooth_window]
 
-        for curve in curves:
+        for index, curve in enumerate(curves):
             if curve.is_diagnostic:
                 continue
-            t_plateau, status = detect_plateau(curve, spec)
+            key = (index, spec.plateau_key)
+            if key not in plateaus:
+                plateaus[key] = detect_plateau(curve, spec)
+            t_plateau, status = plateaus[key]
             rows.append(_row(meta, curve, spec, report, t_plateau, status, eval_curve, occupancy))
     return rows
 
@@ -508,6 +599,11 @@ def _row(
     # anchor.
     comparable = not meta.frozen
     diagnostic = occupancy.get(curve.grid_key) if curve.bins_per_dim is not None else None
+    retained = (
+        retained_report(eval_curve, t_plateau, smooth_window=spec.conv_smooth_window)
+        if comparable
+        else None
+    )
 
     return {
         "env_id": meta.env_id,
@@ -524,8 +620,16 @@ def _row(
         "n_points": int(curve.values.size),
         "value_first": float(curve.values[0]) if curve.values.size else float("nan"),
         "value_last": float(curve.values[-1]) if curve.values.size else float("nan"),
+        # occupancy_at_plateau is the one to read: the claim it defends is "the plateau you
+        # just detected is arithmetic about sample counts, not exploration", and that is a
+        # statement about the grid *where the plateau was found*. occupancy_max is over the
+        # whole curve, whose first point is a half-width window -- occupancy is cells over
+        # samples, so it is structurally inflated there and does peak at point 0 on most
+        # runs. Taking the max would let one transient early window condemn a curve whose
+        # plateau region was perfectly well sampled.
         "occupancy_max": _summarise(diagnostic, np.max),
         "occupancy_last": _summarise(diagnostic, lambda values: values[-1]),
+        "occupancy_at_plateau": _at_step(diagnostic, t_plateau),
         "t_conv": report.t_conv if comparable else None,
         "conv_status": report.status if comparable else "control",
         "random_return": eval_curve.random_return,
@@ -533,11 +637,8 @@ def _row(
         "t_plateau": t_plateau,
         "plateau_status": status,
         "delta": signal_lag(t_plateau, report.t_conv) if comparable else None,
-        "retained": (
-            retained_performance(eval_curve, t_plateau, smooth_window=spec.conv_smooth_window)
-            if comparable
-            else None
-        ),
+        "retained": retained.retained if retained is not None else None,
+        "retained_status": retained.status if retained is not None else "control",
     }
 
 
@@ -545,6 +646,19 @@ def _summarise(curve: Curve | None, reduce: Callable[[np.ndarray], Any]) -> floa
     if curve is None or curve.values.size == 0:
         return None
     return float(reduce(curve.values))
+
+
+def _at_step(curve: Curve | None, step: int | None) -> float | None:
+    """The curve's value at the last point at or before ``step``.
+
+    ``searchsorted`` rather than an exact match: a diagnostic curve and the signal it
+    diagnoses share a step axis today, but reading a value off a grid by equality would
+    break silently the first time that stopped being true.
+    """
+    if curve is None or step is None or curve.values.size == 0:
+        return None
+    index = int(np.searchsorted(curve.steps, step, side="right")) - 1
+    return float(curve.values[index]) if index >= 0 else None
 
 
 def find_runs(directory: str | Path) -> list[tuple[Path, RunMeta]]:
@@ -600,6 +714,7 @@ def analyse_directory(
     run's archive as it lands. Everything is also accumulated and returned, but a batch that
     dies on the last run should not throw away the replays of the ones before it.
     """
+    _reject_resolution_overrides(curve_kwargs)
     rows: list[dict[str, Any]] = []
     curves_by_run: dict[str, list[Curve]] = {}
 
@@ -664,12 +779,13 @@ def load_curves(path: str | Path) -> list[Curve]:
 
 
 def iter_status_counts(frame: pd.DataFrame) -> Iterator[tuple[str, str, int]]:
-    """Yield ``(column, status, count)`` for the two status columns.
+    """Yield ``(column, status, count)`` for each status column.
 
-    The rates belong with any mean of ``Delta`` computed from this frame: the statuses are
-    exactly the rows a mean silently drops, and they are not missing at random.
+    The rates belong with any mean of ``Delta`` or ``retained`` computed from this frame:
+    the statuses are exactly the rows such a mean silently drops, and they are not missing
+    at random.
     """
-    for column in ("conv_status", "plateau_status"):
+    for column in ("conv_status", "plateau_status", "retained_status"):
         if column in frame:
             for status, count in frame[column].value_counts().items():
                 yield column, str(status), int(count)

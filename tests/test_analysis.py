@@ -75,6 +75,20 @@ def make_stream(n=4_000, dim=2, seed=0):
     )
 
 
+def make_grid_pair(values=None, occupancy=None, bins_per_dim=20, clip=5.0):
+    """A grid-SVE curve and the occupancy curve that diagnoses it, on one step axis.
+
+    The occupancy curve decays, which is the shape the real ones have: the first point sits
+    on a half-width window and occupancy is cells over samples, so it peaks at the start.
+    """
+    values = decaying() if values is None else values
+    occupancy = np.linspace(0.9, 0.1, len(values)) if occupancy is None else occupancy
+    return [
+        make_curve(values, signal="sve_grid", bins_per_dim=bins_per_dim, clip=clip),
+        make_curve(occupancy, signal="occupancy", bins_per_dim=bins_per_dim, clip=clip),
+    ]
+
+
 def converging(n=12):
     """A return curve that rises and then holds --- a run with a real ``t_conv``."""
     half = n // 2
@@ -273,7 +287,6 @@ class TestBuildCurves:
         )
         counts = pd.Series([curve.signal for curve in curves]).value_counts()
         assert counts["rnd"] == 3
-        assert counts["sve_knn"] == 3
         assert counts["sve_grid"] == 1
         assert {curve.analysis_seed for curve in curves if curve.signal == "rnd"} == {0, 1, 2}
         assert all(curve.analysis_seed is None for curve in curves if curve.signal == "sve_grid")
@@ -284,6 +297,80 @@ class TestBuildCurves:
         curves = build_curves(make_stream(), window=400, stride=200, bin_counts=(5,), seeds=(0, 1))
         first, second = (curve for curve in curves if curve.signal == "rnd")
         assert not np.allclose(first.values, second.values)
+
+    def test_knn_is_swept_over_seeds_only_where_it_subsamples(self):
+        # knn_entropy draws a subsample only when a window holds more than max_samples
+        # states. Below that the estimate is exact and every seed gives the same curve, so
+        # emitting one row per seed would write duplicates -- and a spread-over-seeds
+        # statistic computed from them would report a variance of 0, which reads as "the
+        # estimator is stable" rather than "the sweep never applied".
+        exact = build_curves(
+            make_stream(), window=400, stride=200, bin_counts=(5,), seeds=(0, 1, 2)
+        )
+        knn = [curve for curve in exact if curve.signal == "sve_knn"]
+        assert len(knn) == 1
+        assert knn[0].analysis_seed is None
+
+        drawn = build_curves(
+            make_stream(),
+            window=400,
+            stride=200,
+            bin_counts=(5,),
+            seeds=(0, 1, 2),
+            knn_max_samples=100,
+        )
+        knn = [curve for curve in drawn if curve.signal == "sve_knn"]
+        assert [curve.analysis_seed for curve in knn] == [0, 1, 2]
+
+    def test_the_seed_actually_moves_the_knn_curve_where_it_is_swept(self):
+        # The counterpart of test_the_seed_actually_moves_the_rnd_curve: whenever a seed
+        # reaches the frame it has to be because the number moved.
+        curves = build_curves(
+            make_stream(),
+            window=400,
+            stride=200,
+            bin_counts=(5,),
+            seeds=(0, 1),
+            knn_max_samples=100,
+        )
+        first, second = (curve for curve in curves if curve.signal == "sve_knn")
+        assert not np.allclose(first.values, second.values)
+
+    def test_an_unswept_knn_curve_is_the_one_the_seeds_would_have_produced(self):
+        # Dropping the sweep must not change the measurement, only the duplication.
+        common = dict(window=400, stride=200, bin_counts=(5,))
+        one = build_curves(make_stream(), seeds=(0,), **common)
+        many = build_curves(make_stream(), seeds=(0, 1, 2), **common)
+        knn_one = next(curve for curve in one if curve.signal == "sve_knn")
+        knn_many = next(curve for curve in many if curve.signal == "sve_knn")
+        assert np.array_equal(knn_one.values, knn_many.values)
+
+    def test_a_second_correction_adds_grid_curves_but_no_second_occupancy_curve(self):
+        # Miller-Madow shifts the entropy estimate; it does not change which cells the
+        # states landed in, so both corrections are diagnosed by one occupancy curve.
+        curves = build_curves(
+            make_stream(),
+            window=400,
+            stride=200,
+            bin_counts=(5,),
+            corrections=("none", "miller_madow"),
+        )
+        counts = pd.Series([curve.signal for curve in curves]).value_counts()
+        assert counts["sve_grid"] == 2
+        assert counts["occupancy"] == 1
+        assert len({curve.label for curve in curves}) == len(curves)
+
+    def test_the_correction_actually_moves_the_grid_curve(self):
+        curves = build_curves(
+            make_stream(),
+            window=400,
+            stride=200,
+            bin_counts=(20,),
+            corrections=("none", "miller_madow"),
+        )
+        plain, corrected = (curve for curve in curves if curve.signal == "sve_grid")
+        # The correction adds (K - 1) / 2N for K occupied cells, so it is strictly positive.
+        assert np.all(corrected.values > plain.values)
 
     def test_rnd_overrides_are_recorded_so_two_frames_cannot_be_confused(self):
         curves = build_curves(
@@ -339,6 +426,96 @@ class TestAnalyseRun:
         assert set(grid) == {0.5, 5.0}
         # A tight clip folds everything into fewer cells, so it cannot occupy more of them.
         assert grid[0.5]["occupancy_max"] < grid[5.0]["occupancy_max"]
+
+    def test_occupancy_is_reported_where_the_plateau_was_found(self):
+        # occupancy_max is over the whole curve, whose first point sits on a half-width
+        # window -- occupancy is cells over samples, so it is inflated there and does peak
+        # at point 0 on most real runs. The claim the diagnostic defends is about the grid
+        # at t_plateau, so that is the number the row has to carry.
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(converging()),
+            make_meta(),
+            curves=make_grid_pair(),
+            detectors=[SPEC],
+        )
+        row = next(row for row in rows if row["signal"] == "sve_grid")
+        assert row["t_plateau"] is not None
+        assert row["occupancy_max"] == pytest.approx(0.9)  # the inflated first point
+        assert row["occupancy_at_plateau"] < row["occupancy_max"]
+
+    def test_occupancy_at_plateau_is_absent_when_there_is_no_plateau(self):
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(converging()),
+            make_meta(),
+            detectors=[SPEC],
+            bin_counts=(5,),
+        )
+        for row in rows:
+            if row["t_plateau"] is None:
+                assert row["occupancy_at_plateau"] is None
+
+    def test_retained_records_why_it_is_absent(self):
+        # The module's own principle: every failure mode survives into the frame. A blank
+        # `retained` from "the signal never plateaued" and one from "the run never beat
+        # random" are opposite findings.
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(np.zeros(12)),  # never beats the random baseline
+            make_meta(),
+            detectors=[SPEC],
+            bin_counts=(5,),
+        )
+        assert {row["retained_status"] for row in rows} <= {"no_improvement", "no_stop_time"}
+        assert all(row["retained"] is None for row in rows)
+
+    def test_a_measured_retained_is_labelled_as_one(self):
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(converging()),
+            make_meta(),
+            curves=make_grid_pair(),
+            detectors=[SPEC],
+        )
+        measured = [row for row in rows if row["retained"] is not None]
+        assert measured
+        assert all(row["retained_status"] == "retained" for row in measured)
+
+    def test_the_control_carries_a_retained_status_too(self):
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(converging()),
+            make_meta(frozen=True, tag="frozen"),
+            detectors=[SPEC],
+            bin_counts=(5,),
+        )
+        assert all(row["retained_status"] == "control" for row in rows)
+
+    def test_the_plateau_detector_runs_once_per_setting_it_depends_on(self, monkeypatch):
+        # t_plateau does not depend on conv_smooth_window, and the full detector grid
+        # varies it three ways -- so an uncached sweep asks the same question three times.
+        import rnd_convergence.analysis as module
+
+        calls = []
+        original = module.detect_plateau
+        monkeypatch.setattr(
+            module,
+            "detect_plateau",
+            lambda curve, spec: (calls.append(spec.plateau_key), original(curve, spec))[1],
+        )
+        detectors = detector_grid(taus=(0.1, 0.2), smooth_windows=(5,), reference_quantiles=(0.5,))
+        rows = analyse_run(
+            make_stream(),
+            make_eval_curve(converging()),
+            make_meta(),
+            detectors=detectors,
+            bin_counts=(5,),
+        )
+        # Three detectable signals, two distinct plateau keys, three conv smoothings.
+        assert len(rows) == 3 * len(detectors)
+        assert len(calls) == 3 * 2
+        assert len(set(calls)) == 2
 
     def test_passing_curves_and_build_settings_together_is_refused(self):
         # The settings would be silently dropped, leaving a frame whose columns describe a
@@ -507,6 +684,13 @@ class TestAnalyseDirectory:
         assert frame.empty
         assert curves_by_run == {}
 
+    def test_measuring_at_another_resolution_is_refused_here_too(self, tmp_path):
+        # The same mistake as in analyse_run, on the function people actually call. Without
+        # the shared guard this reaches build_curves and fails with "got multiple values
+        # for keyword argument 'window'", which explains nothing.
+        with pytest.raises(TypeError, match="RunMeta"):
+            analyse_directory(tmp_path, detectors=[SPEC], window=400, stride=200)
+
 
 @pytest.fixture(scope="module")
 def script():
@@ -586,6 +770,39 @@ class TestAnalyzeScript:
         assert "conv_smooth_window=" in digest.splitlines()[0]
         # One line naming the setting, one of column names, then the selected rows.
         assert len(digest.splitlines()) == 2 + self.ROWS_PER_SETTING
+
+    def test_stale_archives_are_reported_and_not_deleted(self, script, results, tmp_path):
+        # Archives are replaced per stem, so re-running against a smaller results/ leaves
+        # the previous batch next to a frame that does not describe them. Deleting is not
+        # an option -- the streams they were measured from are not in the repository.
+        out = tmp_path / "out"
+        (out / "curves").mkdir(parents=True)
+        stale = out / "curves" / "SomeOtherRun__seed9.npz"
+        stale.write_bytes(b"not a real archive")
+
+        self.analyse(script, results, out, "--quick")
+        assert stale.exists()
+        assert script.report_orphan_archives(out, {"CartPole-v1__seed0": []}) == [
+            "CartPole-v1__frozen__seed0.npz",
+            "SomeOtherRun__seed9.npz",
+        ]
+
+    def test_nothing_is_reported_stale_on_a_clean_run(self, script, results, tmp_path):
+        out = tmp_path / "out"
+        self.analyse(script, results, out, "--quick")
+        names = {p.stem for p in (out / "curves").glob("*.npz")}
+        assert script.report_orphan_archives(out, dict.fromkeys(names, [])) == []
+
+    def test_miller_madow_is_reachable_from_the_entry_point(self, script, results, tmp_path):
+        # The README offers it as a sensitivity check, which it only is if a command can
+        # produce it.
+        out = tmp_path / "out"
+        assert (
+            self.analyse(script, results, out, "--quick", "--corrections", "none", "miller_madow")
+            == 0
+        )
+        frame = pd.read_csv(out / "signals.csv")
+        assert set(frame[frame.signal == "sve_grid"].correction) == {"none", "miller_madow"}
 
     def test_a_sweep_without_the_default_setting_says_so_rather_than_misreporting(self, script):
         # The fallback prints everything. It has to announce that, or the reader takes a

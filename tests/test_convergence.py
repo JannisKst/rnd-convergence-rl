@@ -13,6 +13,7 @@ from rnd_convergence.convergence import (
     convergence_time,
     plateau_time,
     retained_performance,
+    retained_report,
     signal_lag,
     trailing_mean,
 )
@@ -284,6 +285,84 @@ class TestConvergenceReport:
         for returns in ([0.0] * 3 + [100.0] * 7, [0.0] * 10, list(np.linspace(1.0, 50.0, 20))):
             curve = make_curve(returns)
             assert convergence_time(curve) == convergence_report(curve).t_conv
+
+
+class TestReferenceIsIndependentOfSmoothing:
+    """``R_ref`` is what the run scored; ``smooth_window`` decides only when it got there.
+
+    A trailing mean over the last ``n_final`` points averages ``n_final + w - 1`` points
+    with triangular weights, so folding the smoothing into the reference silently widens
+    and re-weights the definition of "final performance". The pilot showed what that
+    costs: MiniGrid-Empty seed 4 read ``R_ref = 0.382`` unsmoothed and ``0.191`` at
+    ``smooth_window=3``, dropping below its own random baseline of 0.213 and flipping the
+    run from ``converged`` to ``not_learned`` on a setting meant only to denoise it.
+    """
+
+    def test_reference_does_not_move_with_the_smoothing_window(self):
+        curve = make_curve([0.0, 60.0, 20.0, 80.0, 40.0, 100.0, 60.0, 100.0, 80.0, 100.0])
+        references = {convergence_report(curve, smooth_window=w).reference for w in (1, 3, 5, 9)}
+        assert len(references) == 1
+
+    def test_a_run_that_beat_random_stays_learned_at_every_smoothing(self):
+        # The seed-4 shape: a rising, very noisy curve whose tail mean clears the baseline
+        # but whose trailing mean over that tail does not.
+        curve = make_curve([0.0] * 5 + [0.0, 0.955, 0.0, 0.955, 0.955], random_return=0.213)
+        assert convergence_report(curve, smooth_window=1).status != "not_learned"
+        for window in (3, 5):
+            report = convergence_report(curve, smooth_window=window)
+            assert report.status != "not_learned", f"flipped at smooth_window={window}"
+
+    def test_smoothing_still_decides_when_the_threshold_was_crossed(self):
+        # The separation must not turn smoothing into a no-op: it is still what stops a
+        # single lucky evaluation from being read as convergence.
+        curve = make_curve([0.0, 100.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+        assert convergence_time(curve, patience=3, smooth_window=1) != convergence_time(
+            curve, patience=3, smooth_window=3
+        )
+
+    def test_retained_uses_the_same_unsmoothed_scale(self):
+        # retained is a fraction of R_ref - R_0 and sits in the same table row as t_conv,
+        # so its denominator has to be the number t_conv was measured against. Only the
+        # point being read off -- the numerator -- may move with the smoothing.
+        returns = [0.0, 60.0, 20.0, 80.0, 40.0, 100.0, 60.0, 100.0, 80.0, 100.0]
+        curve = make_curve(returns, random_return=0.0)
+        reference = convergence_report(curve).reference
+        assert reference == pytest.approx(np.mean(returns[-5:]))
+
+        for window in (1, 3, 5):
+            numerator = trailing_mean(curve.mean_returns, window)[-1]
+            assert retained_performance(curve, 50_000, smooth_window=window) == pytest.approx(
+                numerator / reference, rel=1e-6
+            )
+
+
+class TestRetainedReport:
+    def test_a_measured_fraction_is_labelled_retained(self):
+        curve = make_curve([0.0] * 5 + [100.0] * 5)
+        result = retained_report(curve, 30_000)
+        assert result.status == "retained"
+        assert result.retained == pytest.approx(1.0)
+
+    def test_no_plateau_is_distinguished_from_no_learning(self):
+        # Both come back as a blank `retained` cell, and they are opposite findings: one is
+        # about the signal, the other about the agent.
+        learned = make_curve([0.0] * 5 + [100.0] * 5)
+        assert retained_report(learned, None).status == "no_stop_time"
+        assert retained_report(make_curve([0.0] * 10), 30_000).status == "no_improvement"
+
+    def test_a_stop_before_the_first_evaluation_is_its_own_status(self):
+        # The one the old None hid completely: the signal plateaued before any performance
+        # had been measured, so there is nothing to say it cost.
+        curve = make_curve([0.0] * 5 + [100.0] * 5, step=5_000)
+        assert retained_report(curve, 100).status == "before_first_eval"
+
+    def test_an_empty_curve_is_reported_rather_than_divided_by(self):
+        assert retained_report(make_curve([]), 1_000).status == "empty_curve"
+
+    def test_the_thin_wrapper_agrees_with_the_report(self):
+        curve = make_curve([0.0] * 5 + [100.0] * 5)
+        for t_stop in (None, 100, 30_000):
+            assert retained_performance(curve, t_stop) == retained_report(curve, t_stop).retained
 
 
 class TestRetainedPerformanceConsistency:

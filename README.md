@@ -177,9 +177,16 @@ practical cost of acting on each signal.
    of `log 5000`. A flat SVE curve there is arithmetic about sample counts, not evidence about
    exploration. Occupancy is therefore reported in every cell of the table so that measurements and
    ceilings are distinguishable, and Miller–Madow bias correction is available as a sensitivity
-   check. This is a real limit of the baseline rather than a bug, but the study only earns the claim
-   "SVE degrades with dimensionality" if it can show the degradation is not just the estimator
-   running out of samples.
+   check (`--corrections none miller_madow`). This is a real limit of the baseline rather than a bug,
+   but the study only earns the claim "SVE degrades with dimensionality" if it can show the
+   degradation is not just the estimator running out of samples.
+
+   The column to read is `occupancy_at_plateau`, not `occupancy_max`. The claim being defended is
+   "the plateau this row reports is arithmetic, not exploration", which is a statement about the grid
+   *where the plateau was found*. Occupancy is occupied cells over samples, and the first curve point
+   sits on a half-width window, so it is structurally inflated at the start of every run and does
+   peak there — taking the maximum would let one transient early window condemn a curve whose plateau
+   region was perfectly well sampled. `occupancy_max` and `occupancy_last` are carried for context.
 
 ## Experimental Protocol
 
@@ -272,14 +279,20 @@ It writes `docs/results/signals.csv`, one row per `(run, signal, detector settin
 `docs/results/curves/<stem>.npz` holding every measured curve so the figures need no second replay.
 The detector sweep is *inside* the frame rather than beside it: `Delta` moves with `tau` and with
 both smoothing windows, so a frame that fixed them would report an answer with its uncertainty
-already discarded. `--bins`, `--clips` and `--seeds` widen the measurement sweep the same way, and
-each is a column, so any row can be traced back to the settings that produced it.
+already discarded. `--bins`, `--clips`, `--corrections` and `--seeds` widen the measurement sweep the
+same way, and each is a column, so any row can be traced back to the settings that produced it.
 
-Two columns need reading together with the rest. `conv_status` and `plateau_status` name the rows on
-which `t_conv` or `t_plateau` is undefined — and they are not missing at random, so every mean of
-`Delta` belongs next to those rates rather than quietly computed over what survived. And a grid-SVE
-plateau means nothing where `occupancy_max` is at 1.0: there the estimator is pinned to `log N` and
-the curve is arithmetic about sample counts, not evidence about exploration.
+Three things need reading together with the rest:
+
+- **The status columns.** `conv_status`, `plateau_status` and `retained_status` name the rows on
+  which `t_conv`, `t_plateau` or `retained` is undefined, and they are not missing at random — so
+  every mean belongs next to those rates rather than quietly computed over whatever survived.
+- **`occupancy_at_plateau`.** A grid-SVE plateau means nothing where this sits at 1.0: the estimator
+  is pinned to `log N` there and the curve is arithmetic about sample counts. Read this rather than
+  `occupancy_max`, for the reason given under *Grid-saturation check* above.
+- **`analysis_seed`.** Only the RND replay and a subsampling kNN estimate depend on it; where it is
+  empty the curve is exact and one seed is the whole story. A spread over analysis seeds is
+  meaningful only on rows that carry one.
 
 ## Development
 

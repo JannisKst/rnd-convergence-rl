@@ -32,6 +32,7 @@ from rnd_convergence.analysis import (
     DEFAULT_ANALYSIS_SEEDS,
     DEFAULT_BIN_COUNTS,
     DEFAULT_CLIPS,
+    DEFAULT_CORRECTIONS,
     Curve,
     DetectorSpec,
     analyse_directory,
@@ -67,6 +68,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=list(DEFAULT_CLIPS),
         help="standardised-observation clip bounds to lay the grid over",
+    )
+    parser.add_argument(
+        "--corrections",
+        nargs="+",
+        default=list(DEFAULT_CORRECTIONS),
+        choices=["none", "miller_madow"],
+        help="grid-entropy bias corrections to measure (the README's sensitivity check)",
     )
     parser.add_argument(
         "--seeds",
@@ -136,6 +144,25 @@ def _table(frame: pd.DataFrame) -> str:
     return frame[columns].to_string(index=False, max_colwidth=24)
 
 
+def report_orphan_archives(out: Path, curves_by_run: dict[str, list[Curve]]) -> list[str]:
+    """Name any curve archive in ``out`` that this run did not write, and return them.
+
+    Archives are replaced per stem and never cleaned, so re-running against a smaller
+    ``--results`` leaves the previous batch's archives sitting next to a frame that does not
+    describe them. They are not deleted: the state streams they were measured from are not
+    in the repository, so a stale archive may be the only surviving copy of that curve. It
+    is said out loud instead, because the failure it causes -- figures drawn from curves the
+    frame has no rows for -- is otherwise silent.
+    """
+    orphans = sorted(p.name for p in (out / "curves").glob("*.npz") if p.stem not in curves_by_run)
+    if orphans:
+        print(
+            f"\nwarning: {len(orphans)} archive(s) in {out / 'curves'} are not in this frame "
+            f"and were left untouched: {', '.join(orphans)}"
+        )
+    return orphans
+
+
 def quick_grid() -> list[DetectorSpec]:
     """One detector setting: the digest's, so --quick prints the frame it just built."""
     default = DetectorSpec()
@@ -175,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         modes=args.modes,
         bin_counts=args.bins,
         clips=args.clips,
+        corrections=args.corrections,
         seeds=args.seeds,
         on_run_start=starting,
         on_run=finished,
@@ -182,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
 
     frame_path = args.out / "signals.csv"
     frame.to_csv(frame_path, index=False)
+    report_orphan_archives(args.out, curves_by_run)
 
     print(f"\n{summarise(frame)}\n")
     # The statuses are exactly the rows a mean of Delta silently drops, and they are not

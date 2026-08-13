@@ -187,6 +187,7 @@ def entropy_curve(
     k: int = 4,
     max_samples: int = 4_000,
     clip: float = 5.0,
+    correction: Correction = "none",
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Turn a logged state stream into a state-visitation-entropy curve over training.
@@ -213,6 +214,10 @@ def entropy_curve(
         Passed through to :func:`knn_entropy`.
     clip
         Standardised observations are clipped to ``[-clip, clip]``.
+    correction
+        Bias correction for the grid estimator; ignored by kNN. ``"miller_madow"`` is the
+        sensitivity check the study reports against the plug-in estimate, so it has to be
+        reachable from the analysis layer rather than only from :func:`grid_entropy`.
     seed
         Seeds subsampling inside the kNN estimator.
 
@@ -223,10 +228,16 @@ def entropy_curve(
     """
     if estimator not in ("grid", "knn"):
         raise ValueError(f"unknown estimator {estimator!r}, expected 'grid' or 'knn'")
+    if correction not in ("none", "miller_madow"):
+        # Checked here as well as inside grid_entropy so that a typo in a sweep fails
+        # before the first window rather than once per window of every run.
+        raise ValueError(f"unknown correction {correction!r}, expected 'none' or 'miller_madow'")
 
     def measure(normalized: np.ndarray) -> float:
         if estimator == "grid":
-            return grid_entropy(normalized, bins_per_dim=bins_per_dim, clip=clip)
+            return grid_entropy(
+                normalized, bins_per_dim=bins_per_dim, clip=clip, correction=correction
+            )
         # No clipping is applied for kNN; see RunningNormalizer.normalize.
         return knn_entropy(normalized, k=k, max_samples=max_samples, seed=seed)
 
