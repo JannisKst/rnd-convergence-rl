@@ -7,9 +7,12 @@ course exercise repo (automl-edu/RL-exercises).
 Departure from the usual RND setup: the prediction error is *not* consumed as an
 intrinsic reward here, so the predictor never has to run inside the training loop.
 :func:`streaming_rnd_error` replays a logged :class:`~rnd_convergence.streams.StateStream`
-in visit order, taking exactly one gradient step per minibatch of consecutive states, which
-reproduces the signal an online predictor would have produced while remaining fully
-deterministic and re-runnable for any hyperparameter choice.
+in visit order, taking exactly one gradient step per minibatch of consecutive states. That
+matches what an online predictor consuming the same state sequence under the same update
+rule would have produced, while remaining fully deterministic and re-runnable for any
+hyperparameter choice. It is not a reconstruction of a measurement that was actually
+taken: RND never runs inside the training loop in this project, so there is no recorded
+online signal for the replay to be identical to.
 """
 
 from __future__ import annotations
@@ -56,10 +59,17 @@ class RunningNormalizer:
         self.var = m2 / total
         self.count = total
 
-    def normalize(self, batch: np.ndarray, clip: float = 5.0) -> np.ndarray:
-        """Standardise a batch with the current statistics and clip extreme values."""
+    def normalize(self, batch: np.ndarray, clip: float | None = 5.0) -> np.ndarray:
+        """Standardise a batch with the current statistics, optionally clipping outliers.
+
+        ``clip=None`` leaves outliers in place. The kNN entropy estimator needs that:
+        clipping collapses every outlier onto the boundary, and coincident points give
+        zero nearest-neighbour distances, which drags the estimate towards minus
+        infinity. The grid estimator does its own clipping, since its bin edges have to
+        be finite.
+        """
         normalized = (batch - self.mean) / np.sqrt(self.var + self.epsilon)
-        return np.clip(normalized, -clip, clip)
+        return normalized if clip is None else np.clip(normalized, -clip, clip)
 
 
 def _build_mlp(input_dim: int, hidden_dim: int, output_dim: int, n_layers: int) -> nn.Sequential:

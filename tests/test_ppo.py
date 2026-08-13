@@ -180,10 +180,28 @@ class TestTrain:
         assert stream.env_id == curve.env_id == "CartPole-v1"
         assert stream.seed == curve.seed == 0
 
-    def test_evaluations_land_on_the_requested_grid(self, agent):
+    def test_evaluations_are_stamped_with_the_step_they_ran_at(self, agent):
+        # Evaluation can only happen on a rollout boundary, so the recorded step is the
+        # first boundary at or after each grid point -- never the grid point itself,
+        # which the policy was not at. A mislabel here is a systematic, one-directional
+        # offset in t_conv and therefore in every Delta the project reports.
         _, curve = agent.train(600, eval_interval=200, eval_episodes=2, random_episodes=2)
-        assert np.array_equal(curve.steps, [200, 400, 600])
+
         assert curve.returns.shape == (3, 2)
+        assert np.array_equal(curve.steps, [256, 448, 600])  # rollout_steps=64
+        for step, grid_point in zip(curve.steps, [200, 400, 600]):
+            assert grid_point <= step < grid_point + agent.rollout_steps
+            assert step % agent.rollout_steps == 0 or step == 600
+
+    def test_one_evaluation_per_grid_point_even_when_rollouts_overshoot(self):
+        # rollout_steps > eval_interval: a single rollout jumps several grid points. The
+        # policy is unchanged across them, so re-evaluating once per skipped point would
+        # hand convergence_time's "5 consecutive evaluations" patience free duplicates.
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=256, seed=0)
+        _, curve = agent.train(512, eval_interval=50, eval_episodes=1, random_episodes=1)
+
+        assert np.array_equal(curve.steps, [256, 512])
+        assert np.all(np.diff(curve.steps) > 0)
 
     def test_records_the_random_policy_baseline(self, agent):
         _, curve = agent.train(400, eval_interval=200, eval_episodes=2, random_episodes=3)
@@ -199,3 +217,38 @@ class TestTrain:
         )
         stream, _ = agent.train(128, eval_interval=128, eval_episodes=1, random_episodes=1)
         assert stream.obs_dim == 2
+
+
+class TestDegenerateRolloutGuard:
+    def test_single_step_rollout_does_not_poison_the_policy(self):
+        # torch.std of one element is NaN, so normalising advantages over a 1-step
+        # rollout used to NaN out every parameter. It happens on the final partial
+        # rollout when total_steps is not a multiple of rollout_steps -- i.e. after all
+        # the compute has been spent.
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=32, seed=0)
+        losses = agent.update(agent.collect_rollout(1))
+
+        assert all(np.isfinite(v) for v in losses.values())
+        assert all(np.isfinite(p.detach().numpy()).all() for p in agent.policy.parameters())
+        assert all(np.isfinite(p.detach().numpy()).all() for p in agent.value_net.parameters())
+
+    def test_training_survives_a_ragged_step_budget(self):
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)
+        stream, _ = agent.train(129, eval_interval=64, eval_episodes=1, random_episodes=1)
+
+        assert stream.n_steps == 129
+        assert all(np.isfinite(p.detach().numpy()).all() for p in agent.policy.parameters())
+
+
+class TestLearning:
+    @pytest.mark.slow
+    def test_cartpole_return_improves(self):
+        # The suite can verify every component in isolation and still not tell us the
+        # agent learns; this is the only test that does. If it regresses, every Delta in
+        # the results table is measured against a policy that never converged.
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), seed=0)
+        baseline = agent.evaluate(n_episodes=5).mean()
+        _, curve = agent.train(30_000, eval_interval=5_000, eval_episodes=5, random_episodes=5)
+
+        assert curve.mean_returns[-1] > baseline + 50
+        assert curve.mean_returns[-1] > 150

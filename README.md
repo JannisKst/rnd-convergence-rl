@@ -56,7 +56,8 @@ exploration bonus, giving a case where coverage saturates while return never con
 2. **SVE, fixed grid** — Shannon entropy of the visitation histogram, swept over bins-per-dimension
    ∈ {5, 10, 20} on running-normalised observations. The bin count is treated as an independent
    variable rather than a fixed hyperparameter: the sweep is how discretization sensitivity is
-   demonstrated.
+   demonstrated. Reported alongside **grid occupancy** (occupied cells ÷ samples) and swept over the
+   clip range, for the reason below.
 3. **SVE, kNN (Kozachenko–Leonenko)** — differential entropy estimated over a buffer of visited
    states, without discretization. Differential entropy is not scale-invariant and may be negative,
    so it is compared only *within* an environment.
@@ -69,6 +70,9 @@ Computed offline over the completed run; it deliberately uses information from t
 curve, because it is the target the online signals must approximate.
 
 - Evaluate every `5_000` environment steps, `10` episodes, greedy action selection → curve `R(t)`.
+  Evaluation can only run on a rollout boundary, so each point is timestamped with the step it
+  actually ran at rather than the grid point that triggered it: the gap is up to one rollout and
+  always in the same direction, which would otherwise be a systematic offset in every `Δ`.
 - `R_ref` = mean of the final 5 evaluations; `R_0` = mean return of a random policy in that
   environment.
 - `t_conv` = first `t` at which smoothed `R` stays ≥ `R_0 + 0.95 · (R_ref − R_0)` for **5 consecutive
@@ -77,19 +81,34 @@ curve, because it is the target the online signals must approximate.
 Normalising against the random-policy baseline rather than a percentage of the final value keeps the
 criterion well-defined for negative returns and for 0–1 sparse-reward ranges alike.
 
+`t_conv` is undefined in two opposite cases, which are recorded separately and never pooled: the
+agent never beat a random policy (`not_learned` — the expected outcome on DoorKey-8x8), or it was
+still improving when the budget ran out (`still_improving` — a statement about the budget). Dropping
+both from a cell's mean would bias it towards the fastest-converging seeds, so the rates are reported
+with the means.
+
 ### Signal plateau (`t_plateau`)
 
 Identical functional form, so the comparison is fair across signals: the signal is smoothed with a
 trailing mean, and `t_plateau` is the first `t` at which the change between consecutive points falls
-below `τ` times the **largest change seen so far** and stays there for **5 consecutive windows**.
-Applied unchanged to RND error and to every SVE variant.
+below `τ` times the **median change seen so far** and stays there for **5 consecutive windows**.
+Applied unchanged to RND error and to every SVE variant, on observations standardised by the same
+running normaliser the RND replay uses — "equal footing" covers preprocessing, not just the detector.
 
-Normalising against the signal's own fastest observed rate of change, rather than against its
-magnitude or its accumulated range, is what makes one `τ` valid across signals. It is dimensionless,
-it is defined for the negative values that differential entropy routinely takes (a log-derivative is
-not), and a signal still descending at a constant rate never satisfies it — whereas normalising by
+Normalising against the signal's own characteristic rate of change, rather than against its magnitude
+or its accumulated range, is what makes one `τ` valid across signals. It is dimensionless, it is
+defined for the negative values that differential entropy routinely takes (a log-derivative is not),
+and a signal still descending at a constant rate never satisfies it — whereas normalising by
 accumulated range would eventually declare a steady decline "flat" merely because it had already
 travelled a long way, manufacturing exactly the false early stop the study sets out to measure.
+
+The reference is the running median, not the running maximum. A maximum is set by the single largest
+change anywhere in the run, so one transient spike — exactly what RND error does on reaching a new
+region — relaxes the threshold for every later point; on synthetic curves that moves `t_plateau` by
+tens of thousands of steps, always earlier. `τ` is bounded below by the signal's noise floor: below
+roughly `τ = 0.1` the criterion stops firing at all on noisy signals, and "never fired" is
+indistinguishable from "never plateaued". The `τ` sweep therefore runs over `{0.1, 0.2, 0.3}` and
+reports where the edge is, with `reference_quantile = 1.0` (the maximum) as a sensitivity check.
 
 ### Reported quantities
 
@@ -108,6 +127,15 @@ practical cost of acting on each signal.
 2. **Coverage-vs-convergence check.** Both candidate signals measure state-space coverage, not policy
    quality. We report explicitly where exploration saturates before policy improvement finishes —
    i.e. the regime in which neither signal is a safe stopping criterion.
+3. **Grid-saturation check.** Once cells outnumber samples badly enough that nearly every sample owns
+   a cell, the histogram is uniform over `N` cells and grid SVE returns `log N` *identically*,
+   whatever the policy does — at 8-D with 20 bins and a 5 000-step window it is already within `1e-3`
+   of `log 5000`. A flat SVE curve there is arithmetic about sample counts, not evidence about
+   exploration. Occupancy is therefore reported in every cell of the table so that measurements and
+   ceilings are distinguishable, and Miller–Madow bias correction is available as a sensitivity
+   check. This is a real limit of the baseline rather than a bug, but the study only earns the claim
+   "SVE degrades with dimensionality" if it can show the degradation is not just the estimator
+   running out of samples.
 
 ## Experimental Protocol
 
@@ -116,8 +144,10 @@ the training loop:
 
 1. Training logs the visited-state stream — step index, observation, episode boundary — to disk.
 2. All signals are computed post-hoc. The RND predictor is trained in a single streaming pass over
-   the logged states **in visit order**, which reproduces the online signal exactly; SVE variants are
-   computed over the same stream.
+   the logged states **in visit order**, matching what an online predictor consuming the same state
+   sequence would have produced; SVE variants are computed over the same stream. (RND is never run
+   online here, so there is no recorded signal to be identical to — the replay is faithful to the
+   visit order and the update rule, not to a measurement that was taken.)
 
 One PPO run per `(environment, seed)` therefore supports every bin-count sweep, every `τ` sweep and
 every detector variant without retraining. Matrix: 5 environments × 10 seeds, plus the frozen-policy

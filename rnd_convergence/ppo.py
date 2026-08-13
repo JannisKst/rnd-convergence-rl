@@ -120,6 +120,7 @@ class PPOAgent:
         self.rng = np.random.default_rng(seed)
         self.global_step = 0
         self._obs, _ = self.env.reset(seed=seed)
+        self._flat_obs = self._flatten(self._obs)
         self.eval_env.reset(seed=seed + 10_000)
         self.state_dim = int(np.asarray(self.state_fn(self._obs)).ravel().size)
 
@@ -137,7 +138,17 @@ class PPOAgent:
         Returns the action, its log-probability under the current policy, and the
         critic's value estimate.
         """
-        flat = self._as_tensor(self._flatten(obs)).unsqueeze(0)
+        return self._predict_flat(self._flatten(obs), greedy=greedy)
+
+    @torch.no_grad()
+    def _predict_flat(self, flat_obs: np.ndarray, greedy: bool = False) -> tuple[int, float, float]:
+        """:meth:`predict` on an already-flattened observation.
+
+        The rollout loop reuses the flattened array it has to build anyway, which keeps
+        the per-step cost to one flatten instead of three. Training is the only expensive
+        step in this project, so this loop is worth keeping tight.
+        """
+        flat = self._as_tensor(flat_obs).unsqueeze(0)
         distribution = self.policy.distribution(flat)
         action = distribution.probs.argmax(dim=-1) if greedy else distribution.sample()  # type: ignore[attr-defined]
         value = self.value_net(flat)
@@ -158,12 +169,13 @@ class PPOAgent:
         steps = np.zeros(n_steps, dtype=np.int64)
 
         for t in range(n_steps):
-            observations[t] = self._flatten(self._obs)
+            observations[t] = self._flat_obs
             states[t] = np.asarray(self.state_fn(self._obs), dtype=np.float32).ravel()
             steps[t] = self.global_step
 
-            action, log_prob, value = self.predict(self._obs)
+            action, log_prob, value = self._predict_flat(self._flat_obs)
             next_obs, reward, term, trunc, _ = self.env.step(action)
+            next_flat = self._flatten(next_obs)
 
             actions[t] = action
             log_probs[t] = log_prob
@@ -174,10 +186,14 @@ class PPOAgent:
             # The true successor state, captured before any reset, so that a truncated
             # episode bootstraps from where it actually stopped rather than from the
             # start of the next one.
-            next_observations[t] = self._flatten(next_obs)
+            next_observations[t] = next_flat
 
             self.global_step += 1
-            self._obs = self.env.reset()[0] if (term or trunc) else next_obs
+            if term or trunc:
+                self._obs, _ = self.env.reset()
+                self._flat_obs = self._flatten(self._obs)
+            else:
+                self._obs, self._flat_obs = next_obs, next_flat
 
         return Rollout(
             observations=observations,
@@ -231,9 +247,15 @@ class PPOAgent:
         old_log_probs = self._as_tensor(rollout.log_probs)
         advantage_t = self._as_tensor(advantages)
         return_t = self._as_tensor(returns)
-        advantage_t = (advantage_t - advantage_t.mean()) / (advantage_t.std() + 1e-8)
 
         n = obs.shape[0]
+        if n < 2:
+            # torch.std of a single element is NaN (zero degrees of freedom), and one NaN
+            # update destroys the policy. A rollout this short carries no usable gradient
+            # signal anyway; the only way to get one is a total_steps that is not a
+            # multiple of rollout_steps, i.e. at the very end of a run.
+            return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+        advantage_t = (advantage_t - advantage_t.mean()) / (advantage_t.std() + 1e-8)
         totals = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
         n_batches = 0
 
@@ -311,6 +333,10 @@ class PPOAgent:
 
         The random-policy baseline is measured *before* training, since ``t_conv`` is
         undefined without it.
+
+        Evaluations are triggered on the ``eval_interval`` grid but timestamped with the
+        step they actually ran at, so ``EvalCurve.steps`` is not evenly spaced. That is
+        the honest record: the alternative labels a policy with a step it was never at.
         """
         env_id = env_id or getattr(self.env.spec, "id", type(self.env).__name__)
         random_return = self.random_policy_return(random_episodes)
@@ -330,10 +356,19 @@ class PPOAgent:
             step_chunks.append(rollout.steps)
             end_chunks.append(rollout.dones)
 
-            while self.global_step >= next_eval and next_eval <= total_steps:
-                eval_steps.append(next_eval)
+            if self.global_step >= next_eval:
+                # Record the step the policy was *actually* evaluated at, not the grid
+                # point that triggered it. Evaluation can only happen on a rollout
+                # boundary, so the two differ by up to rollout_steps - 1 -- always in the
+                # same direction, which would put a systematic offset straight into
+                # Delta = t_plateau - t_conv, the one quantity this project reports.
+                eval_steps.append(self.global_step)
                 eval_returns.append(self.evaluate(eval_episodes))
-                next_eval += eval_interval
+                # Skip past every grid point this rollout jumped over rather than
+                # re-evaluating an unchanged policy once per point: those duplicates
+                # would satisfy the "5 consecutive evaluations" patience criterion in
+                # convergence_time for free.
+                next_eval += eval_interval * (1 + (self.global_step - next_eval) // eval_interval)
 
         stream = StateStream(
             steps=np.concatenate(step_chunks),

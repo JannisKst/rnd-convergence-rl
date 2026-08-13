@@ -46,6 +46,9 @@ known-first-party = ["rnd_convergence"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "slow: trains an agent for real; the only check that PPO actually learns",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

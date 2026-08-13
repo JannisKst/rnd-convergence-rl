@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from rnd_convergence.convergence import (
+    convergence_report,
     convergence_time,
     plateau_time,
     retained_performance,
@@ -111,12 +112,15 @@ class TestPlateauTime:
         for tau in (0.01, 0.1, 0.5):
             assert plateau_time(self.steps_for(n), values, tau=tau, patience=5) is None
 
-    def test_constant_signal_returns_none(self):
-        # A signal that never varied gives no scale to be flat relative to, so it is
-        # reported as undetected rather than as plateaued from step one.
+    def test_constant_signal_raises_rather_than_returning_none(self):
+        # A signal that never varied gives no scale to be flat relative to. Returning
+        # None would file it under "never plateaued" alongside genuinely still-moving
+        # signals; a saturated grid-SVE curve pinned to log N lands here, and that is a
+        # fact about the estimator running out of samples, not about exploration.
         n = 30
         values = np.full(n, 7.0)
-        assert plateau_time(self.steps_for(n), values, tau=0.02, patience=5) is None
+        with pytest.raises(ValueError, match="constant"):
+            plateau_time(self.steps_for(n), values, tau=0.02, patience=5)
 
     def test_noise_around_a_flat_level_still_plateaus(self):
         rng = np.random.default_rng(0)
@@ -173,3 +177,101 @@ class TestLagAndRetainedPerformance:
 
     def test_no_learning_gives_none(self):
         assert retained_performance(make_curve([0.0] * 5), 10_000) is None
+
+
+class TestPlateauReferenceRobustness:
+    """A transient spike must not decide where the plateau is.
+
+    The reference rate was originally the running maximum, so the single largest change
+    anywhere in the run set the threshold for every point after it. RND error spikes
+    exactly when the agent reaches a new region, which made the detector fire far too
+    early on precisely the runs the study cares about.
+    """
+
+    ramp_then_flat = np.concatenate([np.linspace(10.0, 1.0, 20), np.full(20, 1.0)])
+    steps = np.arange(1, 41, dtype=np.int64) * 5_000
+
+    def test_spike_barely_moves_the_quantile_reference(self):
+        spiked = self.ramp_then_flat.copy()
+        spiked[1] = 200.0
+
+        clean = plateau_time(self.steps, self.ramp_then_flat)
+        assert plateau_time(self.steps, spiked) == clean
+
+    def test_running_maximum_is_the_fragile_case_it_replaced(self):
+        spiked = self.ramp_then_flat.copy()
+        spiked[1] = 200.0
+
+        clean = plateau_time(self.steps, self.ramp_then_flat, reference_quantile=1.0)
+        spiked_max = plateau_time(self.steps, spiked, reference_quantile=1.0)
+        assert spiked_max is not None and clean is not None
+        assert spiked_max < clean  # the behaviour the default now avoids
+
+    def test_quantile_one_reproduces_the_running_maximum(self):
+        values = np.concatenate([np.linspace(5.0, 1.0, 15), np.full(15, 1.0)])
+        steps = np.arange(1, 31, dtype=np.int64) * 5_000
+        assert plateau_time(steps, values, reference_quantile=1.0) is not None
+
+    def test_rejects_out_of_range_quantile(self):
+        with pytest.raises(ValueError, match="reference_quantile"):
+            plateau_time(self.steps, self.ramp_then_flat, reference_quantile=0.0)
+
+
+class TestPlateauRejectsNonFinite:
+    """``None`` means "never plateaued" and must not also mean "there was a NaN"."""
+
+    def test_nan_raises_instead_of_silently_returning_none(self):
+        steps = np.arange(1, 41, dtype=np.int64) * 5_000
+        values = np.concatenate([np.linspace(10.0, 1.0, 20), np.full(20, 1.0)])
+        values[3] = np.nan
+
+        with pytest.raises(ValueError, match="finite"):
+            plateau_time(steps, values)
+
+    def test_inf_raises_too(self):
+        steps = np.arange(1, 11, dtype=np.int64) * 5_000
+        values = np.ones(10)
+        values[0] = np.inf
+        with pytest.raises(ValueError, match="finite"):
+            plateau_time(steps, values)
+
+
+class TestConvergenceReport:
+    def test_converged_run_is_labelled_and_timed(self):
+        result = convergence_report(make_curve([0.0] * 3 + [100.0] * 7))
+        assert result.status == "converged"
+        assert result.t_conv == 20_000
+
+    def test_run_that_never_beat_random_is_not_learned(self):
+        result = convergence_report(make_curve([0.0] * 10, random_return=0.0))
+        assert result.status == "not_learned"
+        assert result.t_conv is None
+
+    def test_still_rising_run_is_distinguished_from_not_learning(self):
+        # A curve improving right up to the budget: t_conv is None, but for the opposite
+        # reason. Pooling this with "not_learned" and dropping both would bias the
+        # per-cell mean of Delta towards the fastest-converging seeds.
+        result = convergence_report(make_curve(np.linspace(10.0, 500.0, 20), random_return=10.0))
+        assert result.status == "still_improving"
+        assert result.t_conv is None
+        assert result.improvement > 0
+
+    def test_convergence_time_agrees_with_the_report(self):
+        for returns in ([0.0] * 3 + [100.0] * 7, [0.0] * 10, list(np.linspace(1.0, 50.0, 20))):
+            curve = make_curve(returns)
+            assert convergence_time(curve) == convergence_report(curve).t_conv
+
+
+class TestRetainedPerformanceConsistency:
+    def test_smoothing_matches_convergence_time(self):
+        # Both numbers land in the same table row, so they must be read off the same
+        # smoothed curve; the default of no smoothing matches convergence_time's.
+        curve = make_curve([0.0, 60.0, 20.0, 80.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+        smoothed = retained_performance(curve, 15_000, smooth_window=3)
+        raw = retained_performance(curve, 15_000, smooth_window=1)
+        assert smoothed is not None and raw is not None
+        assert smoothed != raw
+
+    def test_n_final_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            retained_performance(make_curve([0.0] * 5 + [100.0] * 5), 30_000, 5)

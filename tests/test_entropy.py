@@ -8,7 +8,14 @@ cells has entropy log K, and a standard normal has differential entropy
 import numpy as np
 import pytest
 
-from rnd_convergence.entropy import entropy_curve, grid_entropy, knn_entropy
+from rnd_convergence.entropy import (
+    entropy_curve,
+    grid_entropy,
+    grid_occupancy,
+    knn_entropy,
+    occupancy_curve,
+)
+from rnd_convergence.rnd import RunningNormalizer
 from rnd_convergence.streams import StateStream
 
 GAUSSIAN_ENTROPY_1D = 0.5 * np.log(2 * np.pi * np.e)
@@ -165,3 +172,115 @@ class TestEntropyCurve:
         stream = stream_from(np.zeros((100, 2)))
         with pytest.raises(ValueError, match="unknown estimator"):
             entropy_curve(stream, estimator="histogram", window=50)
+
+
+class TestGridOccupancy:
+    """The saturation diagnostic for the grid estimator.
+
+    Once cells outnumber samples badly enough that every sample owns a cell, the
+    histogram is uniform over N cells and grid_entropy returns log N whatever the policy
+    does. Without this diagnostic a flat SVE curve on the bottom rung reads as evidence
+    about exploration when it is arithmetic about sample counts.
+    """
+
+    def test_low_dimensional_grid_is_not_saturated(self):
+        rng = np.random.default_rng(0)
+        assert grid_occupancy(rng.normal(size=(5_000, 2)), bins_per_dim=10) < 0.05
+
+    def test_high_dimensional_grid_saturates(self):
+        rng = np.random.default_rng(0)
+        observations = rng.normal(size=(5_000, 8))
+        assert grid_occupancy(observations, bins_per_dim=20) > 0.99
+
+    def test_saturated_entropy_is_log_n(self):
+        rng = np.random.default_rng(0)
+        observations = rng.normal(size=(5_000, 8))
+        assert grid_entropy(observations, bins_per_dim=20) == pytest.approx(np.log(5_000), abs=1e-2)
+
+    def test_saturated_entropy_ignores_the_shape_of_the_distribution(self):
+        # A Gaussian and a uniform of comparable spread have genuinely different
+        # entropies, but once both saturate the estimator returns log N for each and the
+        # difference is invisible. entropy_curve standardises every window to unit
+        # variance, so "comparable spread" is the normal case, not a contrived one.
+        rng = np.random.default_rng(0)
+        gaussian = rng.normal(size=(5_000, 8))
+        uniform = rng.uniform(-1.7, 1.7, size=(5_000, 8))
+
+        assert grid_occupancy(gaussian, bins_per_dim=20) > 0.99
+        assert grid_occupancy(uniform, bins_per_dim=20) > 0.99
+        assert grid_entropy(gaussian, bins_per_dim=20) == pytest.approx(
+            grid_entropy(uniform, bins_per_dim=20), abs=1e-3
+        )
+
+    def test_unsaturated_grid_still_discriminates(self):
+        # The complement: where occupancy is low the estimator is doing real work, which
+        # is what makes occupancy the right thing to report next to every SVE curve.
+        rng = np.random.default_rng(0)
+        broad = rng.normal(size=(5_000, 8))
+        narrow = rng.normal(size=(5_000, 8)) * 0.05
+
+        assert grid_occupancy(narrow, bins_per_dim=20) < 0.1
+        assert grid_entropy(narrow, bins_per_dim=20) < grid_entropy(broad, bins_per_dim=20) - 1.0
+
+    def test_occupancy_curve_tracks_the_entropy_curve_grid(self):
+        rng = np.random.default_rng(0)
+        stream = stream_from(rng.normal(size=(4_000, 3)))
+        entropy_steps, _ = entropy_curve(stream, window=1_000, bins_per_dim=10)
+        occupancy_steps, values = occupancy_curve(stream, window=1_000, bins_per_dim=10)
+
+        assert np.array_equal(entropy_steps, occupancy_steps)
+        assert np.all((values >= 0) & (values <= 1))
+
+
+class TestMillerMadow:
+    def test_correction_raises_the_estimate(self):
+        rng = np.random.default_rng(0)
+        observations = rng.normal(size=(500, 3))
+        plain = grid_entropy(observations, bins_per_dim=10)
+        corrected = grid_entropy(observations, bins_per_dim=10, correction="miller_madow")
+        assert corrected > plain
+
+    def test_correction_is_the_occupied_cell_formula(self):
+        rng = np.random.default_rng(1)
+        observations = rng.normal(size=(400, 2))
+        occupied = grid_occupancy(observations, bins_per_dim=10) * 400
+        plain = grid_entropy(observations, bins_per_dim=10)
+        corrected = grid_entropy(observations, bins_per_dim=10, correction="miller_madow")
+        assert corrected - plain == pytest.approx((occupied - 1) / (2 * 400))
+
+    def test_rejects_unknown_correction(self):
+        with pytest.raises(ValueError, match="unknown correction"):
+            grid_entropy(np.zeros((10, 2)), bins_per_dim=5, correction="jackknife")
+
+
+class TestSharedNormaliser:
+    def test_entropy_uses_the_same_normaliser_as_the_rnd_replay(self):
+        # Preprocessing is part of the "equal footing" claim, so both signals must
+        # standardise with the same running statistics, not merely similar ones.
+        rng = np.random.default_rng(0)
+        stream = stream_from(rng.normal(loc=50.0, scale=10.0, size=(2_000, 3)))
+        # Read the observations back off the stream: it stores float32, and the curve is
+        # computed from that, not from the float64 array it was built with.
+        observations = stream.observations.astype(np.float64)
+        # Steps are 0-based and the evaluation point is inclusive, so the first window of
+        # a run with stride 1000 covers steps 1..1000, i.e. rows 1:1001.
+        end = 1_001
+
+        normalizer = RunningNormalizer(3)
+        normalizer.update(observations[:end])
+        expected = grid_entropy(
+            normalizer.normalize(observations[1:end], clip=None), bins_per_dim=10
+        )
+
+        steps, values = entropy_curve(stream, window=1_000, bins_per_dim=10)
+        assert steps[0] == 1_000
+        assert values[0] == pytest.approx(expected)
+
+    def test_curve_is_invariant_to_a_constant_offset(self):
+        # Running standardisation is what makes the signal track novelty rather than
+        # observation scale; shifting every observation must not move the curve.
+        rng = np.random.default_rng(0)
+        observations = rng.normal(size=(2_000, 3))
+        _, base = entropy_curve(stream_from(observations), window=500, bins_per_dim=10)
+        _, shifted = entropy_curve(stream_from(observations + 100.0), window=500, bins_per_dim=10)
+        assert np.allclose(base, shifted)

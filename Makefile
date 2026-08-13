@@ -1,7 +1,7 @@
 NAME := rnd-convergence
 PACKAGE_NAME := rnd_convergence
 
-.PHONY: help install check format test
+.PHONY: help install check format test test-fast
 
 help:
 	@echo "Makefile ${NAME}"
@@ -9,6 +9,7 @@ help:
 	@echo "* check        check the source code for formatting and lint issues"
 	@echo "* format       format the code with ruff"
 	@echo "* test         run the tests"
+	@echo "* test-fast    run the tests, skipping the slow learning check"
 
 PIP ?= uv pip
 PYTEST ?= uv run pytest
@@ -28,3 +29,6 @@ format:
 
 test:
 	$(PYTEST) tests
+
+test-fast:
+	$(PYTEST) tests -m "not slow"
