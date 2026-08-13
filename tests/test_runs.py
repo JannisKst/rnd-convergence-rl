@@ -8,13 +8,18 @@ check moves the discovery to the test suite, and it globs the config directory s
 added later cannot skip it.
 """
 
+import inspect
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 from hydra import compose, initialize_config_dir
 
 import rnd_convergence
+from rnd_convergence.ppo import PPOAgent
 from rnd_convergence.runs import (
+    FROZEN_TAG,
     MIN_EVAL_POINTS,
     MIN_SIGNAL_POINTS,
     RunMeta,
@@ -49,18 +54,42 @@ def make_meta(**overrides):
         "signal_stride": 2_000,
         "n_states": 200_000,
         "wall_clock_seconds": 123.5,
+        "random_episodes": 20,
+        "agent": {"lr_actor": 3e-4, "gamma": 0.99, "device": "cpu"},
     }
     return RunMeta(**(fields | overrides))
 
 
 class TestRunMeta:
     def test_roundtrip_preserves_contents(self, tmp_path):
-        meta = make_meta(tag="frozen", frozen=True)
+        meta = make_meta(tag=FROZEN_TAG, frozen=True)
         assert load_run_meta(save_run_meta(tmp_path / "run.run.json", meta)) == meta
 
     def test_creates_missing_parent_directories(self, tmp_path):
         path = save_run_meta(tmp_path / "nested" / "deeper" / "run.run.json", make_meta())
         assert path.exists()
+
+    def test_records_the_hyperparameters_the_run_was_trained_with(self, tmp_path):
+        # The point of the field: Hydra's copy lives in a different tree, keyed to the
+        # second, so a job array can put two simultaneous tasks in one directory. A
+        # sidecar that cannot answer "at what learning rate?" is not self-contained.
+        meta = make_meta(agent={"lr_actor": 1e-3, "clip_eps": 0.2})
+        assert load_run_meta(save_run_meta(tmp_path / "run.run.json", meta)).agent == {
+            "lr_actor": 1e-3,
+            "clip_eps": 0.2,
+        }
+
+    def test_sidecars_written_before_the_newer_fields_still_load(self, tmp_path):
+        # Pilot artefacts on disk predate random_episodes and agent; reading them must not
+        # require regenerating the runs that produced them.
+        path = tmp_path / "old.run.json"
+        fields = asdict(make_meta())
+        del fields["random_episodes"], fields["agent"]
+        path.write_text(json.dumps(fields))
+
+        meta = load_run_meta(path)
+        assert meta.random_episodes is None
+        assert meta.agent == {}
 
 
 class TestCheckResolution:
@@ -102,21 +131,42 @@ class TestCheckResolution:
             check_resolution(**(GOOD | {"signal_stride": 0}))
 
 
+def compose_rung(name):
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.3"):
+        return compose(config_name="train", overrides=[f"env={name}"])
+
+
 class TestShippedConfigs:
     """Every rung config in the repo must compose and be sized to be measurable."""
 
     @pytest.mark.parametrize("name", ENV_CONFIGS)
     def test_env_config_composes_and_resolves(self, name):
-        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.3"):
-            cfg = compose(config_name="train", overrides=[f"env={name}"])
+        cfg = compose_rung(name)
         assert cfg.env.id
         assert cfg.frozen is False
         assert cfg.agent.hidden_size > 0
 
     @pytest.mark.parametrize("name", ENV_CONFIGS)
+    def test_train_yaml_keys_the_entry_point_reads_are_all_present(self, name):
+        # scripts/train.py is a Hydra entry point, so a key renamed in train.yaml raises
+        # nowhere until a run is actually launched -- on the cluster, after the queue wait.
+        cfg = compose_rung(name)
+        assert cfg.out_dir
+        assert cfg.random_episodes > 0
+        assert cfg.run_tag is None
+        for key in ("total_steps", "eval_interval", "eval_episodes", "rollout_steps"):
+            assert cfg.env[key] > 0
+
+    def test_agent_config_matches_the_ppo_agent_signature(self):
+        # train.py splats cfg.agent into PPOAgent. An unrecognised key is a TypeError at
+        # the first environment step rather than at compose time, so pin the contract here.
+        cfg = compose_rung(ENV_CONFIGS[0])
+        accepted = set(inspect.signature(PPOAgent.__init__).parameters) - {"self", "env_fn"}
+        assert set(cfg.agent) <= accepted, f"unknown agent keys: {set(cfg.agent) - accepted}"
+
+    @pytest.mark.parametrize("name", ENV_CONFIGS)
     def test_env_config_yields_enough_points_to_measure(self, name):
-        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.3"):
-            cfg = compose(config_name="train", overrides=[f"env={name}"])
+        cfg = compose_rung(name)
         check_resolution(
             total_steps=cfg.env.total_steps,
             eval_interval=cfg.env.eval_interval,
@@ -125,14 +175,25 @@ class TestShippedConfigs:
             signal_stride=cfg.env.signal_stride,
         )
 
+    @pytest.mark.parametrize("name", ENV_CONFIGS)
+    def test_window_overlap_is_the_same_on_every_rung(self, name):
+        # check_resolution counts curve points, which is not the same as counting
+        # independent ones. plateau_time differences consecutive points, so the window
+        # overlap sets how much new data separates them -- and Delta is compared *across*
+        # rungs, so a ratio that varied by rung would put the detector's effective time
+        # scale into the dimensionality axis the table exists to vary.
+        cfg = compose_rung(name)
+        assert cfg.env.signal_window == 2 * cfg.env.signal_stride
+
     def test_the_ladder_is_covered(self):
-        # A missing rung is a silently incomplete results table, so the set is asserted
-        # rather than merely iterated over.
-        assert set(ENV_CONFIGS) == {
+        # A missing rung is a silently incomplete results table, so the committed rungs are
+        # asserted rather than merely iterated over. Subset, not equality: minigrid_doorkey5
+        # is a reserve variant the pilot is meant to choose between keeping and dropping,
+        # and acting on that evidence should not have to edit this test.
+        assert {
             "marsrover",
             "minigrid_empty",
-            "minigrid_doorkey5",
             "minigrid_doorkey8",
             "cartpole",
             "lunarlander",
-        }
+        } <= set(ENV_CONFIGS)

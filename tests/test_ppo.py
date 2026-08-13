@@ -300,7 +300,26 @@ class TestLearning:
         assert frozen_curve.steps.shape == curve.steps.shape
         # The diagnostic log keeps a continuous step axis across both conditions.
         assert len(frozen.update_log) == len(trained.update_log)
-        assert all(entry["policy_loss"] == 0.0 for entry in frozen.update_log)
+        # The losses are nan, not 0.0: no gradient step was taken, and a zero there would
+        # be indistinguishable from a step that happened to produce one -- which update()
+        # really does return on a rollout too short to normalise advantages over.
+        assert all(np.isnan(entry["policy_loss"]) for entry in frozen.update_log)
+        assert all(np.isnan(entry["value_loss"]) for entry in frozen.update_log)
+        # Entropy, by contrast, is measured rather than stubbed. It is what checks the
+        # control's premise -- an unupdated policy stays near-uniform -- instead of
+        # assuming it, so a collapsed column here would mean the control is not one.
+        uniform = np.log(frozen.n_actions)
+        assert all(entry["entropy"] > 0.95 * uniform for entry in frozen.update_log)
+
+    def test_policy_entropy_starts_near_uniform_and_is_measured_not_assumed(self):
+        # The frozen control leans on the head's 0.01 gain keeping the initial policy close
+        # to uniform. That is an initialisation detail one refactor away from being untrue.
+        agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=32, seed=0)
+        rollout = agent.collect_rollout()
+        assert agent.policy_entropy(rollout.observations) == pytest.approx(
+            np.log(agent.n_actions), rel=1e-3
+        )
+        assert np.isnan(agent.policy_entropy(np.zeros((0, agent.obs_dim), dtype=np.float32)))
 
     def test_update_losses_are_retained_for_debugging(self):
         agent = PPOAgent(lambda: gym.make("CartPole-v1"), rollout_steps=64, seed=0)

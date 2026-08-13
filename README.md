@@ -123,7 +123,12 @@ stated with the table, with `reference_quantile = 1.0` (the maximum) as a sensit
 defaults — because differencing costs one point and the leading `min_points − 1` are suppressed. A
 100k-step run measured at `window = 10_000` yields exactly 10 and can only ever answer at the final
 point; `plateau_time` raises rather than returning `None` below the bound, so this cannot be mistaken
-for "no plateau". Runs are therefore sized so that `total_steps / window ≥ 40`.
+for "no plateau". Runs are therefore sized so that `total_steps / stride ≥ 40` — the *stride* sets
+the number of curve points, and the window sets how much data each one averages over. The two are
+held at `window = 2 × stride` on every rung: since `plateau_time` differences consecutive points,
+the overlap between windows determines how much new data separates them, and letting that vary by
+rung would fold the detector's effective time scale into the axis the table is comparing across.
+`check_resolution` enforces the point count before a run is launched.
 
 ### Reported quantities
 

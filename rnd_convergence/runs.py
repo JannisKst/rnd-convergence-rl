@@ -20,11 +20,17 @@ what has to be said *about* a run and does not fit in either of them:
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 RUN_META_SUFFIX = ".run.json"
 UPDATE_LOG_SUFFIX = ".updates.csv"
+
+# The run_stem tag the frozen-policy control is written under. Named here rather than
+# spelled out at the two call sites that have to agree on it: the control and the trained
+# run it is compared against differ only by this string in their filenames.
+FROZEN_TAG = "frozen"
 
 # The signal curves want far more points than plateau_time's hard floor of
 # min_points + patience. At the defaults that floor is 10 points, at which the detector
@@ -63,6 +69,20 @@ class RunMeta:
         ``t_plateau``.
     n_states, wall_clock_seconds
         Recorded for triage and for sizing the full matrix off the pilots.
+    random_episodes
+        Episodes averaged for the random-policy baseline ``R_0``. Belongs with the other
+        measurement settings: ``R_0`` sets the convergence threshold, so a run measured
+        against a noisier baseline has a noisier ``t_conv``.
+    agent
+        The PPO hyperparameters the run was trained with. Hydra already writes these to
+        ``.hydra/config.yaml``, but under its own log directory rather than next to the
+        artefacts, linked to them only by wall-clock timestamp --- and that directory is
+        keyed to the second, so a job array launching tasks simultaneously can land two of
+        them in the same one. Copying the values here makes the sidecar self-contained,
+        which is the whole reason it exists.
+
+    ``random_episodes`` and ``agent`` carry defaults so that sidecars written before they
+    were added still load; an empty ``agent`` means "not recorded", not "no hyperparameters".
     """
 
     env_id: str
@@ -77,6 +97,8 @@ class RunMeta:
     signal_stride: int
     n_states: int
     wall_clock_seconds: float
+    random_episodes: int | None = None
+    agent: dict[str, Any] = field(default_factory=dict)
 
 
 def save_run_meta(path: str | Path, meta: RunMeta) -> Path:

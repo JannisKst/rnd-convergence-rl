@@ -6,6 +6,15 @@
 # would be ~24 evaluation points and t_conv would land on the first or second one ---
 # making Delta a measurement of the detector's own leading-point suppression rather than
 # of the signal. At 512 the curve has ~97 points and t_conv is resolvable.
+#
+# signal_window is 2x signal_stride here, as on every other rung, and that ratio is the
+# constant --- not the window width. plateau_time differences consecutive curve points, so
+# the window overlap sets how much *new* data separates them: at the 5_000 this rung
+# originally carried, consecutive points would have shared 90% of their samples and the
+# patience=5 criterion would have spanned 2_500 new steps against 25_000 on MiniGrid.
+# Delta is compared across rungs, so an overlap that varies by rung would put the detector's
+# effective time scale into the one axis the table varies. 1_000 steps is still 100 episodes
+# over a 5-state space, which is ample for the grid estimator.
 id: MarsRover
 kwargs: {}
 
@@ -14,5 +23,5 @@ eval_interval: 500
 eval_episodes: 10
 rollout_steps: 512
 
-signal_window: 5_000
+signal_window: 1_000
 signal_stride: 500

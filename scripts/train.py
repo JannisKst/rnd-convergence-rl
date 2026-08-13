@@ -36,6 +36,7 @@ from rnd_convergence.convergence import convergence_report
 from rnd_convergence.envs import make_env
 from rnd_convergence.ppo import PPOAgent
 from rnd_convergence.runs import (
+    FROZEN_TAG,
     RUN_META_SUFFIX,
     UPDATE_LOG_SUFFIX,
     RunMeta,
@@ -76,8 +77,19 @@ def main(cfg: DictConfig) -> float:
         cfg.env.signal_stride,
     )
 
+    # "frozen" is the tag train.py picks for cfg.frozen=true, so letting it through as a
+    # run_tag on a trained run would silently overwrite the control it exists to be
+    # compared against -- the one pair of files where a collision destroys the comparison.
+    if cfg.run_tag == FROZEN_TAG and not cfg.frozen:
+        raise ValueError(
+            f"run_tag={FROZEN_TAG!r} is reserved for the frozen-policy control, and this "
+            "run has frozen=false; it would overwrite the control's artefacts. Pass "
+            "frozen=true, or choose another run_tag."
+        )
+
     set_seed(cfg.seed)
     env_kwargs = OmegaConf.to_container(cfg.env.kwargs, resolve=True) or {}
+    agent_kwargs = OmegaConf.to_container(cfg.agent, resolve=True)
 
     def env_fn():
         return make_env(cfg.env.id, seed=cfg.seed, **env_kwargs)
@@ -86,7 +98,7 @@ def main(cfg: DictConfig) -> float:
         env_fn,
         seed=cfg.seed,
         rollout_steps=cfg.env.rollout_steps,
-        **OmegaConf.to_container(cfg.agent, resolve=True),
+        **agent_kwargs,
     )
 
     started = time.perf_counter()
@@ -100,8 +112,9 @@ def main(cfg: DictConfig) -> float:
     )
     elapsed = time.perf_counter() - started
 
-    tag = cfg.run_tag if cfg.run_tag is not None else ("frozen" if cfg.frozen else None)
+    tag = cfg.run_tag if cfg.run_tag is not None else (FROZEN_TAG if cfg.frozen else None)
     out_dir = Path(to_absolute_path(cfg.out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
     stem = run_stem(cfg.env.id, cfg.seed, tag)
 
     save_state_stream(out_dir / f"{stem}{STATE_STREAM_SUFFIX}", stream)
@@ -121,17 +134,22 @@ def main(cfg: DictConfig) -> float:
             signal_stride=int(cfg.env.signal_stride),
             n_states=stream.n_steps,
             wall_clock_seconds=elapsed,
+            random_episodes=int(cfg.random_episodes),
+            agent=agent_kwargs,
         ),
     )
     pd.DataFrame(agent.update_log).to_csv(out_dir / f"{stem}{UPDATE_LOG_SUFFIX}", index=False)
 
     # Report t_conv now rather than at analysis time. It costs nothing, and on a pilot it
     # is the answer being waited for; on a matrix run it is what makes a bad seed visible
-    # in the job log instead of a fortnight later.
+    # in the job log instead of a fortnight later. This is triage, at convergence_report's
+    # defaults -- the reported t_conv comes from the analysis pass, at the detector
+    # settings pinned there, so do not quote this number.
     report = convergence_report(curve)
     final_return = float(curve.mean_returns[-1]) if curve.steps.size else float("nan")
     logger.info(
-        "%s in %.1fs | %d states, %d evaluations | random %.2f -> final %.2f | t_conv=%s (%s)",
+        "%s in %.1fs | %d states, %d evaluations | random %.2f -> final %.2f | "
+        "t_conv=%s (%s, triage only)",
         stem,
         elapsed,
         stream.n_steps,

@@ -239,6 +239,20 @@ class PPOAgent:
             advantages[t] = running
         return advantages, advantages + values
 
+    @torch.no_grad()
+    def policy_entropy(self, observations: np.ndarray) -> float:
+        """Mean entropy of the current policy over ``observations`` (nats).
+
+        :meth:`update` reports this as a by-product of the gradient step. A frozen run
+        takes no gradient step but still needs the number: it is what checks the control's
+        premise, that a policy initialised at head gain 0.01 and never updated really does
+        stay near-uniform (``log n_actions``) for the whole run, rather than being merely
+        assumed to.
+        """
+        if observations.shape[0] == 0:
+            return float("nan")
+        return float(self.policy.distribution(self._as_tensor(observations)).entropy().mean())
+
     def update(self, rollout: Rollout) -> dict[str, float]:
         """Run the clipped-surrogate update over one rollout."""
         with torch.no_grad():
@@ -365,8 +379,11 @@ class PPOAgent:
         a while". Rollout actions are still *sampled* from the untrained policy, whose head
         is initialised at gain 0.01 and is therefore near-uniform — so the logged stream is
         the state distribution of an effectively random policy, which is what the control
-        needs. Update entries are still appended, with zero losses, so the diagnostic log
-        keeps a continuous step axis across both conditions.
+        needs. Update entries are still appended, so the diagnostic log keeps a continuous
+        step axis across both conditions; the two losses are ``nan`` because no gradient
+        step was taken and a 0.0 there would be indistinguishable from one that was, while
+        the entropy column carries the policy's real entropy — that column is how the
+        near-uniform premise above is checked rather than assumed.
         """
         env_id = env_id or getattr(self.env.spec, "id", type(self.env).__name__)
         random_return = self.random_policy_return(random_episodes)
@@ -381,7 +398,11 @@ class PPOAgent:
         while self.global_step < total_steps:
             rollout = self.collect_rollout(min(self.rollout_steps, total_steps - self.global_step))
             losses = (
-                {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+                {
+                    "policy_loss": float("nan"),
+                    "value_loss": float("nan"),
+                    "entropy": self.policy_entropy(rollout.observations),
+                }
                 if freeze_policy
                 else self.update(rollout)
             )

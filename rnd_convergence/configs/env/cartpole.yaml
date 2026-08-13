@@ -10,8 +10,14 @@
 #     on a rollout boundary, so the effective spacing is max(eval_interval, rollout_steps)
 #     --- which is why rollout_steps is a per-rung setting rather than an agent one.
 #   * signal_window / signal_stride set the RND and entropy curves at analysis time.
-#     plateau_time needs min_points + patience points to fire at all and wants far more to
-#     be meaningful, hence the >= 40 points the check enforces.
+#     signal_stride sets how many curve points there are: plateau_time needs
+#     min_points + patience to fire at all and wants far more to be meaningful, hence the
+#     >= 40 points the check enforces. signal_window sets how much data each point averages
+#     over, and is held at exactly 2 * signal_stride on every rung. That ratio is the
+#     constant rather than either width on its own, because plateau_time differences
+#     consecutive points: the overlap is what decides how much new data separates them, and
+#     a ratio that varied by rung would fold the detector's effective time scale into the
+#     dimensionality axis Delta is compared across.
 id: CartPole-v1
 kwargs: {}
 
@@ -21,4 +27,4 @@ eval_episodes: 10
 rollout_steps: 2_048
 
 signal_window: 5_000
-signal_stride: 2_000
+signal_stride: 2_500
