@@ -1,0 +1,549 @@
+"""Offline analysis: from logged runs to the rows of the results table.
+
+Training writes two artefacts and a sidecar per run; this module turns a directory of them
+into one tidy frame in which every row is a single ``(run, signal, detector setting)``
+measurement. The table the study reports, the sensitivity sweeps and the figures are all
+selections from that frame, which is why the sweeps are part of the frame rather than
+separate passes: ``Delta`` moves with ``tau`` and ``smooth_window``, so a frame that fixed
+them would be an answer with its uncertainty already discarded.
+
+Two things here carry most of the weight.
+
+**Nothing this module calls is allowed to kill a batch.**
+:func:`~rnd_convergence.convergence.plateau_time` deliberately *raises* on a curve too
+short to resolve a plateau and on a signal that never changes --- correct for a library,
+where returning ``None`` would make "no plateau" and "unmeasurable" indistinguishable, and
+fatal for a sweep, where one saturated SVE cell would take out the other 431 rows of the
+run. :func:`detect_plateau` maps each of those conditions to a *recorded status* instead.
+
+**Every failure mode has to survive into the frame.** ``t_conv`` is undefined for opposite
+reasons on different rungs (``not_learned`` on DoorKey-8x8, ``still_improving`` on an
+exhausted budget), and a signal can fail to plateau for three more. Dropping any of them
+biases each cell towards the seeds that happened to converge fastest, so they are counted
+and reported next to the means rather than filtered out here.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+import pandas as pd
+
+from rnd_convergence.convergence import (
+    ConvergenceResult,
+    convergence_report,
+    plateau_time,
+    retained_performance,
+    signal_lag,
+)
+from rnd_convergence.entropy import entropy_curve, occupancy_curve
+from rnd_convergence.rnd import streaming_rnd_error
+from rnd_convergence.runs import RUN_META_SUFFIX, RunMeta, load_run_meta
+from rnd_convergence.streams import (
+    EVAL_CURVE_SUFFIX,
+    STATE_STREAM_SUFFIX,
+    EvalCurve,
+    StateStream,
+    load_eval_curve,
+    load_state_stream,
+)
+from rnd_convergence.windows import CurveMode
+
+PlateauStatus = Literal[
+    "plateau",
+    "no_plateau",
+    "too_short",
+    "constant_signal",
+    "non_finite",
+    "empty",
+    "detector_error",
+]
+
+# Substrings of the ValueError messages plateau_time raises for conditions that are facts
+# about the data rather than bugs in the caller. Matching on message text is fragile in
+# general; it is acceptable here because both sides live in this repo, and because
+# TestPlateauStatuses provokes each condition for real and asserts the resulting status ---
+# so a reworded message fails the suite loudly instead of silently degrading every affected
+# cell to "detector_error".
+_DATA_CONDITIONS: tuple[tuple[str, PlateauStatus], ...] = (
+    ("curve points to resolve a plateau", "too_short"),
+    ("signal is constant", "constant_signal"),
+    ("must be finite", "non_finite"),
+)
+
+# The detector settings the study sweeps. tau below ~0.1 stops firing at all on noisy
+# signals, and "never fired" is indistinguishable from "never plateaued", so the sweep
+# stays inside the band where the detector is known to be stable. reference_quantile 1.0
+# is the running maximum, the sensitivity check the README pins the median against.
+DEFAULT_TAUS: tuple[float, ...] = (0.1, 0.2, 0.3)
+DEFAULT_SMOOTH_WINDOWS: tuple[int, ...] = (1, 5, 9)
+DEFAULT_REFERENCE_QUANTILES: tuple[float, ...] = (0.5, 1.0)
+
+# Smoothing applied to the *evaluation* curve before t_conv is read off it. Swept because
+# the MiniGrid rungs produce an all-or-nothing greedy return --- 0.955 or 0.0, depending on
+# which start state the episode drew --- on which an unsmoothed t_conv lands wherever the
+# final few coin flips happened to fall. Smoothing turns that curve into a success rate,
+# which is the thing worth thresholding.
+DEFAULT_CONV_SMOOTH_WINDOWS: tuple[int, ...] = (1, 3, 5)
+
+DEFAULT_BIN_COUNTS: tuple[int, ...] = (5, 10, 20)
+
+# Key the curve settings are stored under inside a saved curve archive.
+CURVE_MANIFEST = "__params__"
+
+
+@dataclass(frozen=True)
+class Curve:
+    """One monitoring signal measured over a run, with the settings that produced it.
+
+    ``signal`` is the estimator family (``rnd``, ``sve_grid``, ``sve_knn``, ``occupancy``)
+    and the remaining fields are what distinguishes curves within it. They travel with the
+    values because they become columns of the frame: the bin count in particular is an
+    independent variable of the study rather than a hyperparameter, since the sweep over it
+    is how discretization sensitivity is demonstrated.
+    """
+
+    signal: str
+    steps: np.ndarray
+    values: np.ndarray
+    mode: CurveMode = "sliding"
+    bins_per_dim: int | None = None
+    clip: float | None = None
+    k: int | None = None
+
+    @property
+    def label(self) -> str:
+        """Stable short name, unique within a run's curve set."""
+        parts = [self.signal]
+        if self.bins_per_dim is not None:
+            parts.append(f"b{self.bins_per_dim}")
+        if self.k is not None:
+            parts.append(f"k{self.k}")
+        parts.append(self.mode)
+        return "_".join(parts)
+
+    @property
+    def is_diagnostic(self) -> bool:
+        """True for curves that describe an estimator rather than the agent.
+
+        Occupancy is the grid estimator's saturation diagnostic, not a convergence signal:
+        asking when it plateaus would be asking when the ratio of occupied cells to samples
+        stopped moving, which answers nothing the study poses. It is built alongside the
+        grid-SVE curves and attached to their rows instead.
+        """
+        return self.signal == "occupancy"
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """The identifying settings, as frame columns."""
+        return {
+            "signal": self.signal,
+            "mode": self.mode,
+            "bins_per_dim": self.bins_per_dim,
+            "clip": self.clip,
+            "k": self.k,
+        }
+
+
+@dataclass(frozen=True)
+class DetectorSpec:
+    """One configuration of :func:`~rnd_convergence.convergence.plateau_time`.
+
+    ``conv_smooth_window`` rides along because it is not free either: it smooths the
+    evaluation curve that ``t_conv`` is read from, and ``Delta`` is the difference of the
+    two. It is applied identically to :func:`~rnd_convergence.convergence.retained_performance`,
+    which that function's docstring requires --- reading the two numbers of one table row
+    off differently smoothed versions of the same curve makes them quietly incomparable.
+    """
+
+    tau: float = 0.1
+    smooth_window: int = 5
+    reference_quantile: float = 0.5
+    conv_smooth_window: int = 1
+
+    def __post_init__(self) -> None:
+        # Fail on a malformed sweep now rather than turning every row of it into a
+        # detector_error status, which would look like a finding about the data.
+        if self.tau <= 0:
+            raise ValueError(f"tau must be > 0, got {self.tau}")
+        if not 0.0 < self.reference_quantile <= 1.0:
+            raise ValueError(f"reference_quantile must be in (0, 1], got {self.reference_quantile}")
+        if self.smooth_window < 1 or self.conv_smooth_window < 1:
+            raise ValueError("smoothing windows must be >= 1")
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """The settings, as frame columns."""
+        return {
+            "tau": self.tau,
+            "smooth_window": self.smooth_window,
+            "reference_quantile": self.reference_quantile,
+            "conv_smooth_window": self.conv_smooth_window,
+        }
+
+
+def detector_grid(
+    taus: Sequence[float] = DEFAULT_TAUS,
+    smooth_windows: Sequence[int] = DEFAULT_SMOOTH_WINDOWS,
+    reference_quantiles: Sequence[float] = DEFAULT_REFERENCE_QUANTILES,
+    conv_smooth_windows: Sequence[int] = DEFAULT_CONV_SMOOTH_WINDOWS,
+) -> list[DetectorSpec]:
+    """The full cross-product of detector settings to sweep."""
+    return [
+        DetectorSpec(tau, smooth_window, quantile, conv_smooth)
+        for tau in taus
+        for smooth_window in smooth_windows
+        for quantile in reference_quantiles
+        for conv_smooth in conv_smooth_windows
+    ]
+
+
+def build_curves(
+    stream: StateStream,
+    *,
+    window: int,
+    stride: int,
+    bin_counts: Sequence[int] = DEFAULT_BIN_COUNTS,
+    modes: Sequence[CurveMode] = ("sliding",),
+    clip: float = 5.0,
+    knn_k: int = 4,
+    knn_max_samples: int = 4_000,
+    seed: int = 0,
+    rnd_kwargs: dict[str, Any] | None = None,
+) -> list[Curve]:
+    """Measure every monitoring signal over one logged run.
+
+    All curves share the grid :func:`~rnd_convergence.windows.iter_windows` lays out from
+    ``window`` and ``stride``, which is what makes their ``t_plateau`` values comparable.
+    Both should come from the run's :class:`~rnd_convergence.runs.RunMeta`: they are a
+    property of how the run was *sized*, and choosing a different stride afterwards moves
+    every plateau.
+
+    The RND curve is built once and only in sliding mode --- see
+    :func:`~rnd_convergence.rnd.streaming_rnd_error` for why there is no cumulative variant
+    --- while the SVE curves are built per requested mode. Note that a cumulative SVE curve
+    lands on the same step axis as the sliding RND curve without being comparable to it;
+    ``mode`` is carried into the frame so that comparison is never made by accident.
+    """
+    curves = [
+        Curve(
+            signal="rnd",
+            **_named_curve(
+                streaming_rnd_error(
+                    stream, window=window, stride=stride, seed=seed, **(rnd_kwargs or {})
+                )
+            ),
+        )
+    ]
+    for mode in modes:
+        for bins in bin_counts:
+            curves.append(
+                Curve(
+                    signal="sve_grid",
+                    mode=mode,
+                    bins_per_dim=bins,
+                    clip=clip,
+                    **_named_curve(
+                        entropy_curve(
+                            stream,
+                            estimator="grid",
+                            mode=mode,
+                            window=window,
+                            stride=stride,
+                            bins_per_dim=bins,
+                            clip=clip,
+                        )
+                    ),
+                )
+            )
+            curves.append(
+                Curve(
+                    signal="occupancy",
+                    mode=mode,
+                    bins_per_dim=bins,
+                    clip=clip,
+                    **_named_curve(
+                        occupancy_curve(
+                            stream,
+                            mode=mode,
+                            window=window,
+                            stride=stride,
+                            bins_per_dim=bins,
+                            clip=clip,
+                        )
+                    ),
+                )
+            )
+        curves.append(
+            Curve(
+                signal="sve_knn",
+                mode=mode,
+                k=knn_k,
+                **_named_curve(
+                    entropy_curve(
+                        stream,
+                        estimator="knn",
+                        mode=mode,
+                        window=window,
+                        stride=stride,
+                        k=knn_k,
+                        max_samples=knn_max_samples,
+                        seed=seed,
+                    )
+                ),
+            )
+        )
+    return curves
+
+
+def _named_curve(curve: tuple[np.ndarray, np.ndarray]) -> dict[str, np.ndarray]:
+    steps, values = curve
+    return {"steps": steps, "values": values}
+
+
+def detect_plateau(curve: Curve, spec: DetectorSpec) -> tuple[int | None, PlateauStatus]:
+    """``t_plateau`` for one curve under one detector setting, and why it is what it is.
+
+    Never raises on a data condition. ``plateau_time`` distinguishes "this signal never
+    flattened" (``None``) from "this curve cannot answer the question" (raises), and both
+    distinctions matter to the result --- a grid-SVE curve pinned to ``log N`` by cell
+    saturation is arithmetic about sample counts, not evidence that exploration never
+    settled. So each is mapped to its own status rather than collapsed or propagated.
+    """
+    if curve.values.size == 0:
+        return None, "empty"
+    try:
+        t_plateau = plateau_time(
+            curve.steps,
+            curve.values,
+            tau=spec.tau,
+            smooth_window=spec.smooth_window,
+            reference_quantile=spec.reference_quantile,
+        )
+    except ValueError as error:
+        message = str(error)
+        for needle, status in _DATA_CONDITIONS:
+            if needle in message:
+                return None, status
+        # Not a known data condition. Recorded rather than raised so the rest of the sweep
+        # survives, but it means something unanticipated happened and should be read as a
+        # bug report, not as a property of this run.
+        return None, "detector_error"
+    return (None, "no_plateau") if t_plateau is None else (t_plateau, "plateau")
+
+
+def analyse_run(
+    stream: StateStream,
+    eval_curve: EvalCurve,
+    meta: RunMeta,
+    *,
+    curves: Sequence[Curve] | None = None,
+    detectors: Sequence[DetectorSpec] | None = None,
+    **curve_kwargs: Any,
+) -> list[dict[str, Any]]:
+    """One row per ``(signal, detector setting)`` for a single run.
+
+    Pass ``curves`` to reuse a set already built for this run; otherwise they are built
+    here at the resolution ``meta`` records. Building is the expensive half and the sweep
+    the cheap one, so the two are separable on purpose --- re-sweeping detector settings
+    over cached curves costs nothing.
+
+    ``window`` and ``stride`` are not accepted here: they come from ``meta``, because they
+    are a property of how the run was *sized* and measuring one run at a different
+    resolution from the rest of the table moves its ``t_plateau`` for reasons that have
+    nothing to do with its signal. Build the curves yourself and pass them in if that is
+    genuinely what you want.
+    """
+    if set(curve_kwargs) & {"window", "stride"}:
+        raise TypeError(
+            "window and stride come from the run's RunMeta, not from the caller: the run "
+            "was sized for them and check_resolution verified them before it was launched. "
+            "To measure at another resolution, call build_curves directly and pass curves="
+        )
+    if curves is None:
+        curves = build_curves(
+            stream, window=meta.signal_window, stride=meta.signal_stride, **curve_kwargs
+        )
+    detectors = detector_grid() if detectors is None else detectors
+
+    occupancy = {(curve.bins_per_dim, curve.mode): curve for curve in curves if curve.is_diagnostic}
+    reports: dict[int, ConvergenceResult] = {}
+    rows: list[dict[str, Any]] = []
+
+    for spec in detectors:
+        if spec.conv_smooth_window not in reports:
+            reports[spec.conv_smooth_window] = convergence_report(
+                eval_curve, smooth_window=spec.conv_smooth_window
+            )
+        report = reports[spec.conv_smooth_window]
+
+        for curve in curves:
+            if curve.is_diagnostic:
+                continue
+            t_plateau, status = detect_plateau(curve, spec)
+            rows.append(_row(meta, curve, spec, report, t_plateau, status, eval_curve, occupancy))
+    return rows
+
+
+def _row(
+    meta: RunMeta,
+    curve: Curve,
+    spec: DetectorSpec,
+    report: ConvergenceResult,
+    t_plateau: int | None,
+    status: PlateauStatus,
+    eval_curve: EvalCurve,
+    occupancy: dict[tuple[int | None, str], Curve],
+) -> dict[str, Any]:
+    """Assemble one frame row."""
+    # Delta is excluded for the control by the `frozen` *flag*, never by its convergence
+    # status. An untrained network is still a consistent policy: the frozen CartPole pilot
+    # scored 168.7 against a random baseline of 20.7 on a flat curve, which satisfies the
+    # convergence criterion and reports `converged`. Trusting that status would put a
+    # meaningless Delta into the table on the one run whose job is to be a credibility
+    # anchor.
+    comparable = not meta.frozen
+    diagnostic = occupancy.get((curve.bins_per_dim, curve.mode)) if curve.bins_per_dim else None
+
+    return {
+        "env_id": meta.env_id,
+        "seed": meta.seed,
+        "tag": meta.tag,
+        "frozen": meta.frozen,
+        "total_steps": meta.total_steps,
+        "signal_window": meta.signal_window,
+        "signal_stride": meta.signal_stride,
+        "wall_clock_seconds": meta.wall_clock_seconds,
+        **curve.params,
+        "label": curve.label,
+        **spec.params,
+        "n_points": int(curve.values.size),
+        "value_first": float(curve.values[0]) if curve.values.size else float("nan"),
+        "value_last": float(curve.values[-1]) if curve.values.size else float("nan"),
+        "occupancy_max": _summarise(diagnostic, np.max),
+        "occupancy_last": _summarise(diagnostic, lambda values: values[-1]),
+        "t_conv": report.t_conv if comparable else None,
+        "conv_status": report.status if comparable else "control",
+        "random_return": eval_curve.random_return,
+        "reference_return": report.reference,
+        "t_plateau": t_plateau,
+        "plateau_status": status,
+        "delta": signal_lag(t_plateau, report.t_conv) if comparable else None,
+        "retained": (
+            retained_performance(eval_curve, t_plateau, smooth_window=spec.conv_smooth_window)
+            if comparable
+            else None
+        ),
+    }
+
+
+def _summarise(curve: Curve | None, reduce: Any) -> float | None:
+    if curve is None or curve.values.size == 0:
+        return None
+    return float(reduce(curve.values))
+
+
+def find_runs(directory: str | Path) -> list[tuple[Path, RunMeta]]:
+    """Every completed run in ``directory``, as ``(stem path, metadata)``.
+
+    Discovery is by sidecar rather than by ``.npz``, so a run whose training died between
+    writing the stream and writing the sidecar is skipped instead of being analysed as if
+    it were complete.
+    """
+    directory = Path(directory)
+    found = []
+    for path in sorted(directory.glob(f"*{RUN_META_SUFFIX}")):
+        stem = directory / path.name[: -len(RUN_META_SUFFIX)]
+        if (stem.with_name(stem.name + STATE_STREAM_SUFFIX)).exists():
+            found.append((stem, load_run_meta(path)))
+    return found
+
+
+def load_run(stem: Path) -> tuple[StateStream, EvalCurve, RunMeta]:
+    """Load the three artefacts of the run at ``stem``."""
+    return (
+        load_state_stream(stem.with_name(stem.name + STATE_STREAM_SUFFIX)),
+        load_eval_curve(stem.with_name(stem.name + EVAL_CURVE_SUFFIX)),
+        load_run_meta(stem.with_name(stem.name + RUN_META_SUFFIX)),
+    )
+
+
+def analyse_directory(
+    directory: str | Path,
+    *,
+    detectors: Sequence[DetectorSpec] | None = None,
+    on_run: Any = None,
+    **curve_kwargs: Any,
+) -> tuple[pd.DataFrame, dict[str, list[Curve]]]:
+    """Analyse every run in ``directory``.
+
+    Returns the tidy frame and the built curves keyed by run stem name --- the curves are
+    what the figures are drawn from, and rebuilding them for plotting would repeat the
+    expensive half of this function.
+
+    ``on_run`` is called with ``(stem, meta, rows)`` after each run, for progress
+    reporting; a directory of LunarLander runs takes minutes and silence is
+    indistinguishable from a hang.
+    """
+    rows: list[dict[str, Any]] = []
+    curves_by_run: dict[str, list[Curve]] = {}
+
+    for stem, meta in find_runs(directory):
+        stream, eval_curve, _ = load_run(stem)
+        curves = build_curves(
+            stream, window=meta.signal_window, stride=meta.signal_stride, **curve_kwargs
+        )
+        run_rows = analyse_run(stream, eval_curve, meta, curves=curves, detectors=detectors)
+        curves_by_run[stem.name] = curves
+        rows.extend(run_rows)
+        if on_run is not None:
+            on_run(stem, meta, run_rows)
+
+    return pd.DataFrame(rows), curves_by_run
+
+
+def save_curves(path: str | Path, curves: Sequence[Curve]) -> Path:
+    """Write a run's curves to a single ``.npz`` so figures need no rebuild.
+
+    The identifying settings are stored as a JSON manifest inside the archive rather than
+    encoded in the array names. Labels are for humans reading a legend; recovering
+    ``bins_per_dim`` by parsing one back would make the round trip depend on the label
+    format never changing, and would lose ``clip``, which no label carries.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {
+        CURVE_MANIFEST: np.array(json.dumps([curve.params for curve in curves]))
+    }
+    for index, curve in enumerate(curves):
+        arrays[f"{index}__steps"] = curve.steps
+        arrays[f"{index}__values"] = curve.values
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def load_curves(path: str | Path) -> list[Curve]:
+    """Read curves written by :func:`save_curves`."""
+    with np.load(Path(path), allow_pickle=False) as data:
+        manifest = json.loads(str(data[CURVE_MANIFEST]))
+        return [
+            Curve(steps=data[f"{index}__steps"], values=data[f"{index}__values"], **params)
+            for index, params in enumerate(manifest)
+        ]
+
+
+def iter_status_counts(frame: pd.DataFrame) -> Iterator[tuple[str, str, int]]:
+    """Yield ``(column, status, count)`` for the two status columns.
+
+    The rates belong with any mean of ``Delta`` computed from this frame: the statuses are
+    exactly the rows a mean silently drops, and they are not missing at random.
+    """
+    for column in ("conv_status", "plateau_status"):
+        if column in frame:
+            for status, count in frame[column].value_counts().items():
+                yield column, str(status), int(count)

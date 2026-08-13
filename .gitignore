@@ -17,11 +17,13 @@ dist/
 venv/
 uv.lock
 
-# Hydra / experiment outputs
-outputs/
-multirun/
-results/
-logs/
+# Hydra / experiment outputs. Anchored to the repository root: these patterns name the
+# raw output directories, and an unanchored `results/` also swallows docs/results/, which
+# holds the curated frame and curves the report is written from and must be committed.
+/outputs/
+/multirun/
+/results/
+/logs/
 wandb/
 runs/
 
