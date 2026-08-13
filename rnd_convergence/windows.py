@@ -14,6 +14,18 @@ re-run a set-valued estimator over each window. Sharing the grid is therefore no
 that falls out of the implementations --- it has to be deliberate, and the only way to keep
 it true under later edits is to let both signals derive their points from one function.
 
+What the shared grid does *not* make interchangeable is ``mode``. The step axis comes from
+``stride`` alone, so a cumulative curve and a sliding one land on exactly the same points ---
+but a cumulative point summarises the whole run so far and a sliding one only the last
+``window`` steps, which is a different time scale behind an identical axis.
+:func:`~rnd_convergence.convergence.plateau_time` reads the difference between consecutive
+points, so it responds to that: on synthetic decay-then-flat curves the sliding version
+plateaus and the cumulative transform of the same signal does not fire at all, the same
+asymmetry the pilot reported for cumulative SVE. An identical step axis is therefore
+necessary for two ``t_plateau`` values to be comparable, not sufficient --- the mode has to
+match too. RND error is measured in sliding mode only, for the reason given in
+:func:`~rnd_convergence.rnd.streaming_rnd_error`.
+
 The windows are half-open on the left, ``(point - window, point]``, and labelled by their
 upper edge: a curve point at step ``t`` summarises the ``window`` steps of training that
 ended at ``t``, and never contains information from after it.
@@ -48,8 +60,9 @@ def iter_windows(
         the closer analogue of "has the agent stopped finding new regions".
     window
         Width of the sliding window in environment steps. Sets how much data each curve
-        point summarises. Ignored by ``"cumulative"`` except that it still bounds nothing:
-        the grid is set by ``stride`` in both modes.
+        point summarises. ``"cumulative"`` ignores it, since every window there starts at
+        the beginning of the run; the grid comes from ``stride`` in both modes, so the two
+        modes yield the same points regardless.
     stride
         Spacing of curve points in environment steps; defaults to ``window``, which makes
         consecutive windows adjacent and non-overlapping. Note that ``stride`` alone

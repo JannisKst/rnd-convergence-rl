@@ -137,6 +137,15 @@ derive their points from one function, `windows.iter_windows`. `check_resolution
 point count *and* the ratio before a run is launched, since both reach a run through the config,
 where a command-line override would otherwise sail past the tests that pin them.
 
+That equal footing does not extend to sliding-versus-cumulative. Because the grid comes from the
+stride alone, a cumulative SVE curve lands on exactly the same points as the sliding ones — but
+each of its points summarises the whole run rather than one window, which is a different time
+scale behind an identical axis, and `plateau_time` responds to the difference. The cumulative
+variant is therefore reported as a sensitivity check against sliding SVE, never as a row set
+against the RND column: RND error is measured in sliding mode only, a cumulative version of it
+being a running mean still dominated by the high-novelty start of the run long after the current
+policy has stopped finding anything.
+
 ### Reported quantities
 
 `Δ = t_plateau − t_conv` per environment and signal, aggregated over seeds with bootstrap confidence

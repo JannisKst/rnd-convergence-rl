@@ -10,6 +10,8 @@ set-valued estimator), so nothing keeps them aligned except deriving both from
 iter_windows, and nothing keeps *that* true except this test.
 """
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -122,3 +124,34 @@ class TestSignalsShareOneGrid:
             streaming_rnd_error(stream, window=2_000, stride=1_000, seed=0)[1][:3],
             streaming_rnd_error(stream, window=1_000, stride=1_000, seed=0)[1][:3],
         )
+
+
+class TestModesAreNotInterchangeable:
+    """One grid makes two ``t_plateau`` values comparable only when the mode also matches.
+
+    The step axis comes from the stride alone, so switching mode does not move a single
+    curve point --- which makes "same steps" the most inviting wrong reason to read a
+    cumulative SVE row against the RND column.
+    """
+
+    def test_cumulative_shares_the_axis_but_not_the_time_scale(self):
+        stream = stream_of(20_000)
+        window, stride = 2_000, 1_000
+        sliding_steps, sliding = entropy_curve(stream, window=window, stride=stride)
+        cumulative_steps, cumulative = entropy_curve(
+            stream, mode="cumulative", window=window, stride=stride
+        )
+        rnd_steps, _ = streaming_rnd_error(stream, window=window, stride=stride)
+
+        assert np.array_equal(sliding_steps, cumulative_steps)
+        assert np.array_equal(sliding_steps, rnd_steps)
+        # Identical points, different amounts of data behind each one. plateau_time reads
+        # the difference between consecutive points, so it sees exactly this.
+        assert not np.allclose(sliding, cumulative)
+
+    def test_the_rnd_curve_is_sliding_only(self):
+        # A cumulative RND curve would be a running mean over the whole replay, dominated by
+        # the high-novelty start long after the current policy stopped finding anything --- a
+        # lagging integral of the question the signal is asked. If a mode parameter is ever
+        # added here, windows.py and the README's resolution section both need revisiting.
+        assert "mode" not in inspect.signature(streaming_rnd_error).parameters

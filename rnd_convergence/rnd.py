@@ -182,6 +182,17 @@ def streaming_rnd_error(
     down to how each curve was built. Averaging per-state errors over a sliding window costs
     nothing extra here --- unlike the entropy estimators, the expensive part (the replay)
     has already happened by this point and does not depend on the grid.
+
+    There is deliberately no ``mode`` parameter: this curve is always sliding. A cumulative
+    one would average every per-state error since the start of the run, so it would stay
+    dominated by the high-novelty beginning long after the current policy had stopped
+    finding anything --- a lagging integral of the quantity actually being asked about, which
+    is whether novelty is exhausted *now*. It also barely fires: on synthetic decay-then-flat
+    signals :func:`~rnd_convergence.convergence.plateau_time` locates the plateau on the
+    sliding curve and returns ``None`` on the cumulative transform of the very same signal.
+    Since :func:`~rnd_convergence.windows.iter_windows` takes its points from ``stride``
+    alone, a cumulative SVE curve nevertheless shares this curve's step axis --- so equal
+    steps must not be read as licence to compare the two ``t_plateau`` values directly.
     """
     if stream.n_steps == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
