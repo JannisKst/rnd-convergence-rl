@@ -74,10 +74,12 @@ exploration bonus, giving a case where coverage saturates while return never con
 Computed offline over the completed run; it deliberately uses information from the full training
 curve, because it is the target the online signals must approximate.
 
-- Evaluate every `5_000` environment steps, `10` episodes, greedy action selection → curve `R(t)`.
-  Evaluation can only run on a rollout boundary, so each point is timestamped with the step it
-  actually ran at rather than the grid point that triggered it: the gap is up to one rollout and
-  always in the same direction, which would otherwise be a systematic offset in every `Δ`.
+- Evaluate on a per-rung grid (`2_000` steps on CartPole up to `10_000` on LunarLander, set by each
+  rung's config so that the run resolves at least 20 evaluation points), `10` episodes, greedy
+  action selection → curve `R(t)`. Evaluation can only run on a rollout boundary, so each point is
+  timestamped with the step it actually ran at rather than the grid point that triggered it: the gap
+  is up to one rollout and always in the same direction, which would otherwise be a systematic
+  offset in every `Δ`.
 - `R_ref` = mean of the final 5 evaluations; `R_0` = mean return of a random policy in that
   environment.
 - `t_conv` = first `t` at which smoothed `R` stays ≥ `R_0 + 0.95 · (R_ref − R_0)` for **5 consecutive
@@ -151,8 +153,21 @@ policy has stopped finding anything.
 `Δ = t_plateau − t_conv` per environment and signal, aggregated over seeds with bootstrap confidence
 intervals. `Δ < 0` means the signal fires early and stopping on it costs performance; `Δ ≈ 0` means
 it tracks convergence; `Δ > 0` means it fires late and saves no compute. Reported alongside:
-sensitivity of `Δ` to `τ` and to bin count, and retained performance `R(t_plateau) / R_ref` as the
-practical cost of acting on each signal.
+sensitivity of `Δ` to `τ` and to bin count, and retained performance as the practical cost of acting
+on each signal. Every cell of the table carries all of them — the `Δ` and its interval, how many of
+the rung's seeds plateaued at that setting, the grid occupancy where those plateaus were found, and
+`retained` — because each one disarms a way of misreading the others.
+
+**`retained`** is the fraction of the run's improvement kept by stopping at `t_plateau`, measured on
+the random-policy-anchored scale `(R(t_plateau) − R_0) / (R_ref − R_0)` so that it is defined for
+negative returns and for 0–1 sparse rewards alike. It is *not* reported on a rung whose greedy return
+is all-or-nothing: where the evaluation curve takes two distinct values, the ratio divides one
+two-valued number by a difference of two more and lands at −0.24 or 4.39 for arithmetic reasons
+rather than as a noisy estimate of anything. The frame carries `eval_distinct_returns` so that this
+is decided by the data rather than by a list of rung names, and such cells read `retained n/a`. Both
+MiniGrid rungs are in that case, and no number of extra evaluation episodes changes it — their
+within-evaluation variance is already zero, because a fixed start state and a greedy policy make
+every episode of one evaluation the same episode.
 
 ## Controls
 
@@ -169,14 +184,37 @@ practical cost of acting on each signal.
    reported next to `Δ` rather than treated as a diagnostic. The denominator is the sweep
    `τ` × `smooth_window` × `reference_quantile` — 18 configurations — times the seeds of the rung.
 
-   Measured on the shared window grid, RND plateaus in 0.83–1.00 of them on every rung, while grid
-   SVE runs 1.00 at 1-D down to 0.33 at 8-D and falls further as bins are added within a rung (0.78
-   → 0.67 → 0.50 across b5 → b10 → b20 on CartPole); the kNN variant is the least robust of the
-   three on the discrete rungs. Bin-count dependence therefore shows up in *whether* the detector
-   fires, not only in where — which is the study's hypothesis appearing one level earlier than
-   expected. `docs/figures/detector_robustness.png` is that measurement; the rate is also printed in
-   every cell of the `Δ` table, since a cell whose mean rests on two of five seeds is a different
-   claim from one that rests on five.
+   The rates are reported split by `reference_quantile`, because pooling them would mix this
+   study's candidate detector with the sensitivity check it is pinned against. At the primary
+   setting (`reference_quantile = 0.5`, the running median), measured on the shared window grid:
+
+   | Rung | RND | grid b5 | grid b10 | grid b20 | kNN |
+   | --- | --- | --- | --- | --- | --- |
+   | MarsRover (1-D) | 1.00 | 1.00 | 1.00 | 1.00 | 0.67 |
+   | MiniGrid-Empty (3-D) | 0.96 | 0.33 | 0.22 | 0.22 | 0.00 |
+   | MiniGrid-DoorKey-8x8 (3-D) | 0.89 | 0.11 | 0.11 | 0.00 | 0.00 |
+   | CartPole (4-D) | 1.00 | 0.56 | 0.33 | 0.22 | 0.22 |
+   | LunarLander (8-D) | 0.67 | 0.00 | 0.00 | 0.11 | 0.00 |
+
+   RND plateaus in 0.67–1.00 of configurations on every rung. Grid SVE fires in all of them on the
+   1-D anchor and then collapses: 0.00–0.56 on every rung below it, and 0.00–0.11 at 8-D. Within a
+   rung, adding bins costs robustness where there is any left to lose — 0.56 → 0.33 → 0.22 across
+   b5 → b10 → b20 on CartPole — while at 8-D every bin count is already at the floor and the
+   ordering carries no information. So bin-count dependence shows up in *whether* the detector
+   fires and not only in where, which is the study's hypothesis appearing one level earlier than
+   expected.
+
+   Under `reference_quantile = 1.0` every rate rises sharply (grid SVE reaches 0.67–1.00 even at
+   8-D), which is that setting doing exactly what the *Signal plateau* section predicts: referencing
+   the running maximum relaxes the threshold after any spike, so the detector fires readily and
+   early. Quoting the pooled rate would therefore understate the gap between the two signals rather
+   than flatter it — but it would still be a blend of two detectors, so the split is what is
+   reported. Both are in `docs/figures/robustness_by_quantile.csv`;
+   `docs/figures/detector_robustness.png` shows the pooled bars with this qualifier in its caption.
+
+   One more qualifier travels with all of it: every rung except MiniGrid-Empty is a single pilot
+   seed, so this is a trend and not yet a measurement. The seed count is on the figure's axis and in
+   the table.
 
    Feasibility is settled on a pilot run per rung *before* the full matrix is launched: a baseline
    column that turns out to be empty is not something to discover after 50 cluster runs.
@@ -332,14 +370,23 @@ second detector run at plotting time.
 Four artefacts, plus the `.csv` behind each:
 
 - **The `Δ` table**, rungs down the ladder against signals, aggregated over seeds with a percentile
-  bootstrap CI at one pinned detector setting named in the caption, each cell carrying the rate at
-  which the signal fired and each row the rate at which `t_conv` was defined.
-- **Detector robustness** — control 3 above, as a figure.
+  bootstrap CI at one pinned detector setting named in the caption. Each cell also carries how many
+  seeds plateaued at that setting, the grid occupancy where they did, and `retained`; each row
+  carries the seed count and the rate at which `t_conv` was defined.
+- **Detector robustness** — control 3 above, as a figure, with the seed count on the axis and the
+  `reference_quantile` split in `robustness_by_quantile.csv`.
 - **`Δ` sensitivity** — the same cells measured at every detector configuration, drawn as a band on a
   symmetric-log axis. `Δ` moves by tens of thousands of steps across that sweep, so the band is the
   honest form of the result and the pinned number is a reading inside it.
 - **The confound figure** — trained against frozen curves for both signals on one rung, which is
-  control 1 in one picture.
+  control 1 in one picture. It is drawn at the detector setting nearest the pin at which the detector
+  fires on *both* conditions, since its claim is that the two plateaus land in the same place and a
+  setting that detects only one cannot support it; the figure names the setting it used and labels
+  any condition that did not plateau there in words rather than leaving a ring absent.
+
+Since the two are easy to confuse: the `Δ` table's per-cell count is over *seeds at one detector
+setting*, while the robustness figure's fraction is over *detector configurations across the sweep*.
+The same cell can read 1/1 seeds and 0.94 of configurations without contradiction.
 
 `--conditions` adds the discrimination experiment: it compares runs written under a `run_tag`, so
 several training conditions can live in one results directory, and pairs `t_conv` with `t_plateau`

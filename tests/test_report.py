@@ -40,6 +40,7 @@ from rnd_convergence.report import (
     RND,
     Pin,
     bootstrap_ci,
+    confound_pin,
     conv_status_rates,
     delta_band,
     delta_summary,
@@ -53,6 +54,7 @@ from rnd_convergence.report import (
     signal_order,
     summarise_cells,
     tracking,
+    tracking_sweep,
     with_signal_labels,
 )
 from rnd_convergence.streams import run_stem
@@ -80,6 +82,9 @@ def make_row(
     t_plateau=15_000,
     conv_status="converged",
     plateau_status="plateau",
+    retained=0.9,
+    occupancy_at_plateau=None,
+    eval_distinct_returns=40,
     **overrides,
 ):
     """One frame row, with the null-where-it-does-not-apply convention of the real frame."""
@@ -104,7 +109,13 @@ def make_row(
         "t_plateau": t_plateau,
         "plateau_status": plateau_status,
         "delta": delta,
-        "occupancy_at_plateau": None,
+        "retained": None if frozen or t_plateau is None else retained,
+        "retained_status": "control" if frozen else "retained",
+        "occupancy_at_plateau": (
+            occupancy_at_plateau if signal == "sve_grid" and t_plateau is not None else None
+        ),
+        "occupancy_max": None,
+        "eval_distinct_returns": eval_distinct_returns,
     }
     row.update(overrides)
     return row
@@ -341,6 +352,85 @@ class TestTables:
         assert "1.00" in text
         assert "CartPole" in text
 
+    def test_both_tables_say_how_many_seeds_are_behind_a_rung(self, frame):
+        # The pilot rungs are single-seed and the trend is read across them; a rate printed
+        # without its denominator invites five rungs to be weighed equally.
+        delta_text = format_delta_table(
+            delta_summary(frame, PIN, reps=200), conv_status_rates(frame, PIN), PIN
+        )
+        robustness_text = format_robustness_table(robustness(frame, PIN))
+
+        assert "Seeds" in delta_text
+        assert "Seeds" in robustness_text
+
+    def test_the_caption_does_not_credit_a_library_the_code_does_not_use(self, frame):
+        text = format_delta_table(
+            delta_summary(frame, PIN, reps=200), conv_status_rates(frame, PIN), PIN
+        )
+
+        assert "rliable" not in text
+        assert "percentile bootstrap" in text
+
+    def test_the_two_kinds_of_firing_rate_are_not_both_called_fired(self, frame):
+        # The Delta cell counts seeds at one setting; the robustness table counts detector
+        # configurations across the sweep. One document carrying both under one word invites
+        # "100%" and "0.94" to be read as a contradiction.
+        delta_text = format_delta_table(
+            delta_summary(frame, PIN, reps=200), conv_status_rates(frame, PIN), PIN
+        )
+
+        rows = [line for line in delta_text.splitlines() if line.startswith("| MarsRover")]
+        assert "plateau in 2/2 seeds" in delta_text
+        # The word belongs to the sweep, so no *cell* may use it; the prose below the table
+        # is free to explain the difference.
+        assert not any("fired" in row for row in rows)
+
+    def test_a_grid_cell_carries_the_occupancy_of_the_grid_it_plateaued_on(self):
+        rows = full_sweep(signal="sve_grid", bins_per_dim=10, occupancy_at_plateau=0.19)
+        frame = make_frame(rows)
+        text = format_delta_table(
+            delta_summary(frame, PIN, reps=200), conv_status_rates(frame, PIN), PIN
+        )
+
+        assert "occ 0.190" in text
+
+    def test_a_saturated_grid_cell_says_so(self):
+        # At occupancy 1.0 the estimator is pinned to log N and the plateau is arithmetic.
+        rows = full_sweep(signal="sve_grid", bins_per_dim=20, occupancy_at_plateau=1.0)
+        frame = make_frame(rows)
+        text = format_delta_table(
+            delta_summary(frame, PIN, reps=200), conv_status_rates(frame, PIN), PIN
+        )
+
+        assert "SATURATED" in text
+
+    def test_retained_is_reported_but_suppressed_on_a_quantised_evaluation(self):
+        graded = make_frame(full_sweep(retained=0.87, eval_distinct_returns=40))
+        binary = make_frame(
+            full_sweep(env_id="MiniGrid-Empty-5x5-v0", retained=4.39, eval_distinct_returns=3)
+        )
+
+        assert "retained 0.87" in format_delta_table(
+            delta_summary(graded, PIN, reps=200), conv_status_rates(graded, PIN), PIN
+        )
+        assert "retained n/a" in format_delta_table(
+            delta_summary(binary, PIN, reps=200), conv_status_rates(binary, PIN), PIN
+        )
+
+    def test_the_robustness_split_separates_the_rejected_reference_quantile(self, frame):
+        split = robustness(frame, PIN, split_reference_quantile=True)
+
+        assert set(split["reference_quantile"]) == {PIN.detector.reference_quantile}
+        assert "reference_quantile" in format_robustness_table(robustness(frame, PIN), split)
+
+    def test_the_discrimination_table_orders_grid_columns_by_bin_count(self):
+        rows = []
+        for bins in (20, 5, 10):
+            rows += full_sweep(tag="lr", signal="sve_grid", bins_per_dim=bins)
+        summary = discrimination_summary(make_frame(rows), PIN, ["lr"])
+
+        assert list(summary["signal_label"]) == ["SVE grid b5", "SVE grid b10", "SVE grid b20"]
+
     def test_a_signal_that_tracks_convergence_has_a_slope_near_one(self):
         rows = []
         for seed, (t_conv, t_plateau) in enumerate(
@@ -363,6 +453,39 @@ class TestTables:
         assert np.isnan(tracked["spearman"])  # t_plateau never moved
         assert tracked["t_plateau_range"] == 0.0
         assert tracked["t_conv_range"] == 30_000
+
+    def test_the_sweep_answers_the_same_question_at_every_detector_setting(self):
+        # The pinned row is one cell of the sweep, and the cell that answers most favourably
+        # is the one a headline would otherwise be built on.
+        rows = []
+        for seed, t_conv in enumerate([10_000, 20_000, 30_000, 40_000]):
+            for tau in TAUS:
+                for conv in CONV_SMOOTH_WINDOWS:
+                    rows.append(
+                        make_row(
+                            tag="lr",
+                            seed=seed,
+                            tau=tau,
+                            conv_smooth_window=conv,
+                            t_conv=t_conv,
+                            # Tracks at one tau, pinned at every other.
+                            t_plateau=t_conv + 5_000 if tau == 0.1 else 55_000,
+                        )
+                    )
+        swept = tracking_sweep(make_frame(rows), PIN, ["lr"])
+
+        tracking_config = swept[swept["tau"] == 0.1].iloc[0]
+        assert tracking_config["slope"] == pytest.approx(1.0)
+        assert swept["slope"].isna().sum() == 2  # t_plateau never moved at the other two taus
+        assert len(swept) == len(TAUS)
+
+    def test_the_sweep_reports_a_p_value_beside_the_correlation(self):
+        rows = []
+        for seed, t_conv in enumerate([10_000, 20_000, 30_000, 40_000]):
+            rows += full_sweep(tag="lr", seed=seed, t_conv=t_conv, t_plateau=t_conv + 5_000)
+        swept = tracking_sweep(make_frame(rows), PIN, ["lr"])
+
+        assert (swept["p_value"] < 0.05).all()
 
     def test_tracking_needs_three_paired_runs(self):
         rows = full_sweep(tag="lr", seed=0, t_conv=10_000, t_plateau=20_000)
@@ -400,6 +523,54 @@ def make_archive(path, *, steps=None, decay=True):
         ),
     ]
     return save_curves(path, curves)
+
+
+class TestConfoundSetting:
+    """Where to draw the trained-vs-frozen figure, given that it is a comparison."""
+
+    def both_conditions(self, *, frozen_fires_at):
+        rows = []
+        for tau in TAUS:
+            for conv in CONV_SMOOTH_WINDOWS:
+                rows.append(make_row(tau=tau, conv_smooth_window=conv))
+                fires = tau in frozen_fires_at
+                rows.append(
+                    make_row(
+                        tau=tau,
+                        conv_smooth_window=conv,
+                        tag="frozen",
+                        frozen=True,
+                        t_conv=None,
+                        conv_status="control",
+                        t_plateau=16_000 if fires else None,
+                        plateau_status="plateau" if fires else "no_plateau",
+                    )
+                )
+        return make_frame(rows)
+
+    def test_keeps_the_pinned_setting_when_the_control_plateaus_there(self):
+        frame = self.both_conditions(frozen_fires_at={PIN.detector.tau})
+        chosen, note = confound_pin(frame, PIN, env_id="CartPole-v1", seed=0)
+
+        assert chosen == PIN
+        assert "same setting as the table" in note
+
+    def test_moves_to_the_nearest_setting_where_both_conditions_fire(self):
+        # The real case: at the table's tau the control never plateaus, so a figure drawn
+        # there shows one ring and cannot say "both land in the same place".
+        frame = self.both_conditions(frozen_fires_at={0.3})
+        chosen, note = confound_pin(frame, PIN, env_id="CartPole-v1", seed=0)
+
+        assert chosen.detector.tau == 0.3
+        assert chosen.detector.conv_smooth_window == PIN.detector.conv_smooth_window
+        assert "not the table's setting" in note
+
+    def test_falls_back_to_the_pin_and_says_so_when_nothing_qualifies(self):
+        frame = self.both_conditions(frozen_fires_at=set())
+        chosen, note = confound_pin(frame, PIN, env_id="CartPole-v1", seed=0)
+
+        assert chosen == PIN
+        assert "no configuration in the sweep" in note
 
 
 class TestFigures:
@@ -481,7 +652,20 @@ class TestReportScript:
             "delta_table.md",
             "detector_robustness.png",
             "robustness.csv",
+            "robustness_by_quantile.csv",
         ]
+
+    def test_the_generated_table_names_the_command_that_made_it(self, script, frame, tmp_path):
+        # The committed table is not what the documented bare command produces --- the
+        # discrimination section only appears with --conditions --- so the file has to say
+        # which invocation it came from.
+        results = self.prepare(frame, tmp_path)
+        out = tmp_path / "figures"
+        script.main(["--results", str(results), "--out", str(out), "--reps", "200"])
+
+        header = (out / "delta_table.md").read_text().splitlines()[1]
+        assert header.startswith("<!-- Reproduce with: python scripts/report.py")
+        assert "--reps 200" in header
 
     def test_a_missing_frame_is_reported_rather_than_a_traceback(self, script, tmp_path):
         assert script.main(["--results", str(tmp_path), "--out", str(tmp_path / "out")]) == 1

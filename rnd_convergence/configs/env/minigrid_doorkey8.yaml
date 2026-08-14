@@ -8,13 +8,13 @@
 id: MiniGrid-DoorKey-8x8-v0
 kwargs: {}
 
-# 20 evaluation episodes, matching minigrid_empty and for the same reason: the greedy return
-# on a MiniGrid rung is all-or-nothing per episode, so the evaluation curve is a Bernoulli
-# mean and `retained` divides one by a difference of two. Episodes here are capped short
-# enough that the extra ten cost little.
+# 10 evaluation episodes, matching minigrid_empty and for the same measured reason: extra
+# episodes buy nothing here. The within-evaluation standard deviation is exactly zero at all
+# 100 evaluation points, because the agent never reaches the goal and every episode returns 0
+# whatever layout it drew. Averaging more zeros does not make the number more precise.
 total_steps: 500_000
 eval_interval: 5_000
-eval_episodes: 20
+eval_episodes: 10
 rollout_steps: 2_048
 
 signal_window: 10_000

@@ -93,11 +93,18 @@ DEFAULT_TAUS: tuple[float, ...] = (0.1, 0.2, 0.3)
 DEFAULT_SMOOTH_WINDOWS: tuple[int, ...] = (1, 5, 9)
 DEFAULT_REFERENCE_QUANTILES: tuple[float, ...] = (0.5, 1.0)
 
-# Smoothing applied to the *evaluation* curve before t_conv is read off it. Swept because
-# the MiniGrid rungs produce an all-or-nothing greedy return --- 0.955 or 0.0, depending on
-# which start state the episode drew --- on which an unsmoothed t_conv lands wherever the
-# final few coin flips happened to fall. Smoothing turns that curve into a success rate,
-# which is the thing worth thresholding.
+# Smoothing applied to the *evaluation* curve before t_conv is read off it. Swept because the
+# MiniGrid rungs produce an all-or-nothing greedy return --- 0.955 or 0.0 --- on which an
+# unsmoothed t_conv lands wherever the last few evaluations happened to fall.
+#
+# The switching is the *policy's*, not the estimator's, which is worth stating because it
+# bounds what smoothing can do. Empty-5x5 starts the agent in a fixed cell and greedy action
+# selection is deterministic, so every episode of one evaluation is the same episode: the
+# measured within-evaluation standard deviation is zero at all 60 points, and more evaluation
+# episodes cannot make a point more precise. What moves between points is whether the current
+# argmax solves the maze at all. Smoothing therefore turns the curve into a success rate over
+# the last few evaluations, which is the thing worth thresholding --- and it is also why it
+# cannot rescue `retained`, whose numerator is one point of that same two-valued curve.
 DEFAULT_CONV_SMOOTH_WINDOWS: tuple[int, ...] = (1, 3, 5)
 
 DEFAULT_BIN_COUNTS: tuple[int, ...] = (5, 10, 20)
@@ -634,6 +641,16 @@ def _row(
         "conv_status": report.status if comparable else "control",
         "random_return": eval_curve.random_return,
         "reference_return": report.reference,
+        # How many distinct values the evaluation curve takes at all. It is carried because
+        # `retained` divides one point of that curve by a difference of two others, and where
+        # the curve is all-or-nothing that ratio is not a noisy estimate of anything --- it is
+        # one two-valued number over a difference of two more, and lands at -0.24 or 4.39 for
+        # arithmetic reasons. Both MiniGrid rungs report 2 and 1 here: Empty-5x5 starts the
+        # agent in a fixed cell so a greedy episode either solves it or does not, and
+        # DoorKey-8x8 is never solved at all. More evaluation episodes cannot change this
+        # (their within-evaluation standard deviation is already zero), which is exactly why
+        # the fact belongs in the frame rather than in a rung-name lookup downstream.
+        "eval_distinct_returns": int(np.unique(np.round(eval_curve.mean_returns, 6)).size),
         "t_plateau": t_plateau,
         "plateau_status": status,
         "delta": signal_lag(t_plateau, report.t_conv) if comparable else None,

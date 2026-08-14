@@ -17,9 +17,12 @@ plateaued there is no Delta, and a bar of height zero would read as "fired at ex
 t_conv" --- the opposite of the finding. Those cells are left empty and their count is on
 the axis.
 
-**Delta is drawn on a symmetric log axis.** It spans -480 to +218 000 across the sweep, and
-on a linear axis every rung except the widest collapses onto the zero line; the sign is the
-thing being read, so the axis has to keep zero and both signs legible at once.
+**Delta is drawn on a symmetric log axis.** It spans roughly -90 000 to +800 000 across the
+sweep and the ladder, and on a linear axis every rung except the widest collapses onto the
+zero line; the sign is the thing being read, so the axis has to keep zero and both signs
+legible at once. The tick range follows the data on each side separately --- a symmetric
+range would give a figure whose left half is empty on a table where almost every Delta is
+positive.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from rnd_convergence.report import (  # noqa: E402
     signal_label,
     signal_order,
 )
+from rnd_convergence.runs import FROZEN_TAG  # noqa: E402
 from rnd_convergence.streams import run_stem  # noqa: E402
 
 # Categorical hues for the estimator families, plus an ordered three-step ramp of the second
@@ -156,8 +160,9 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
                         color=INK,
                     )
 
+        seeds = fired.groupby("env_id", observed=True)["n_seeds"].max()
         ax.set_xticks(np.arange(len(envs)))
-        ax.set_xticklabels([_rung_tick(env) for env in envs])
+        ax.set_xticklabels([_rung_tick(env, int(seeds.get(env, 0))) for env in envs])
         ax.set_ylim(0, 1.18)
         ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
         ax.set_ylabel("fraction of detector configurations\nin which the signal plateaus")
@@ -171,15 +176,37 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
             fig,
             ax,
             "Fraction over the detector sweep (tau x smooth_window x reference_quantile) and "
-            f"the seeds of each rung. Estimator settings: mode={pin.mode}, clip={pin.clip:g}, "
-            f"correction={pin.correction}, analysis_seed={pin.analysis_seed}.",
+            "the seeds of each rung, both named on the axis --- most rungs are a single pilot "
+            "seed here, so read the trend and not the digits. Half of the eighteen "
+            "configurations use reference_quantile=1.0, the running maximum, which this "
+            "project keeps as a sensitivity check rather than as a candidate detector; "
+            "robustness_by_quantile.csv carries the rates split by it. Estimator settings: "
+            f"mode={pin.mode}, clip={pin.clip:g}, correction={pin.correction}, "
+            f"analysis_seed={pin.analysis_seed}.",
         )
         return _save(fig, path)
 
 
-def _rung_tick(env_id: str) -> str:
+def _rung_tick(env_id: str, seeds: int | None = None) -> str:
+    """Rung label for an axis: name, dimensionality, and how many seeds are behind it.
+
+    The seed count belongs on the axis rather than in the caption. Most rungs here are a
+    single pilot seed, and a bar chart read without that reads as five equally weighted
+    measurements.
+    """
     display, dim = rung_display(env_id)
-    return display if dim is None else f"{display}\n({dim}-D)"
+    parts = [] if dim is None else [f"{dim}-D"]
+    if seeds is not None:
+        parts.append(f"{seeds} seed" + ("" if seeds == 1 else "s"))
+    return display if not parts else f"{display}\n({', '.join(parts)})"
+
+
+def _decades(limit: float) -> list[int]:
+    """Decade tick positions covering ``limit``, from the symlog threshold upwards."""
+    if limit <= SYMLOG_THRESHOLD:
+        return []
+    top = int(np.ceil(np.log10(limit)))
+    return [10**power for power in range(int(np.log10(SYMLOG_THRESHOLD)), top + 1)]
 
 
 def figure_delta_sensitivity(
@@ -243,11 +270,13 @@ def figure_delta_sensitivity(
         ax.axvline(0, color=MUTED, linewidth=1.0, zorder=2)
         ax.set_xscale("symlog", linthresh=SYMLOG_THRESHOLD)
         # Ticks at the decades and at zero only. Symlog's default puts a tick at each end of
-        # the linear region as well, which lands +/-1000 on top of the zero label.
-        widest = float(np.abs(band["delta"]).max())
-        top = max(4, int(np.ceil(np.log10(widest))) if widest > 0 else 4)
-        decades = [10**power for power in range(3, top + 1)]
-        ax.set_xticks([-value for value in reversed(decades)] + [0] + decades)
+        # the linear region as well, which lands +/-1000 on top of the zero label. The two
+        # sides are extended independently: Delta is overwhelmingly positive here, and a
+        # symmetric axis would spend its left half on a decade nothing occupies.
+        values = band["delta"].to_numpy(dtype=float)
+        negative = _decades(-values.min())
+        positive = _decades(values.max())
+        ax.set_xticks([-value for value in reversed(negative)] + [0] + positive)
         ax.xaxis.set_major_formatter(_thousands)
         ax.set_xlabel("Delta = t_plateau - t_conv  (environment steps, symmetric log)")
         ax.set_ylim(-0.8, len(rows) - 0.2)
@@ -337,22 +366,30 @@ def figure_confound(
     env_id: str,
     seed: int = 0,
     bins_per_dim: int = 10,
+    setting_note: str = "",
 ) -> Path | None:
     """Trained against frozen, for both signals, on one rung.
 
     The control's whole purpose in one picture. The RND predictor takes a gradient step for
-    every state it sees whether or not the agent found anything, so its error decays under a
-    policy that never learns --- and if the decay looks the same in both conditions, the
-    plateau the study detects is the predictor converging rather than novelty running out.
-    Grid SVE is the contrast: it moves only when the policy moves, so its frozen curve is
-    flat. Drawn as two panels because the two signals differ by orders of magnitude and
-    sharing one axis would make the smaller of them a flat line by construction.
+    every state it sees whether or not the agent found anything, so its error falls under a
+    policy that never learns too --- and if the detector fires at the same place in both
+    conditions, what it fires on is largely the predictor converging rather than novelty
+    running out. Grid SVE is the contrast: it moves only when the policy moves. Drawn as two
+    panels because the two signals differ by orders of magnitude and sharing one axis would
+    make the smaller of them a flat line by construction.
+
+    Where a condition has no plateau at this setting the curve is labelled as such, in words,
+    on the panel. A missing ring is otherwise indistinguishable from a ring that was not
+    drawn, and on a figure whose entire claim is "these two land in the same place" a silently
+    absent second detection is the failure mode, not a detail. ``setting_note`` is
+    :func:`~rnd_convergence.report.confound_pin`'s sentence explaining which setting this is
+    and why.
 
     Returns ``None`` when either condition is missing from the archives, since the figure's
     claim is a comparison and half of it is not worth drawing.
     """
     trained = _load_archive(curves_dir, env_id, seed, tag=None)
-    frozen = _load_archive(curves_dir, env_id, seed, tag="frozen")
+    frozen = _load_archive(curves_dir, env_id, seed, tag=FROZEN_TAG)
     if trained is None or frozen is None:
         return None
 
@@ -368,35 +405,50 @@ def figure_confound(
         drew = False
         for ax, (label, signal, bins) in zip(np.atleast_1d(axes), panels, strict=True):
             color = color_for(label)
-            for condition, archive, style in (
-                ("trained", trained, "-"),
-                ("frozen", frozen, (0, (5, 2))),
+            for condition, archive, style, offset in (
+                ("trained", trained, "-", (7, 6)),
+                # The two rings can land within a curve point of each other --- that is the
+                # finding --- so their labels are offset in opposite directions rather than
+                # both up-right, where they would overprint into an unreadable smear.
+                ("frozen", frozen, (0, (5, 2)), (7, -12)),
             ):
                 curve = find_curve(archive, signal=signal, pin=pin, bins_per_dim=bins)
                 if curve is None:
                     continue
                 drew = True
+                step = marks.get((condition, label))
+                # Named in the legend, not left as an absent ring. "No plateau here" is a
+                # result about the detector; an unexplained gap reads as an oversight, and a
+                # legend entry cannot collide with the data the way a floating note can.
                 ax.plot(
                     curve.steps,
                     curve.values,
                     linestyle=style,
                     color=color,
-                    label=condition,
+                    label=condition if step is not None else f"{condition} — no plateau",
                     zorder=3,
                 )
-                step = marks.get((condition, label))
-                if step is not None:
-                    index = int(np.searchsorted(curve.steps, step, side="right")) - 1
-                    if index >= 0:
-                        ax.scatter(
-                            curve.steps[index],
-                            curve.values[index],
-                            s=52,
-                            facecolor="white",
-                            edgecolor=color,
-                            linewidths=1.6,
-                            zorder=5,
-                        )
+                if step is None:
+                    continue
+                index = int(np.searchsorted(curve.steps, step, side="right")) - 1
+                if index >= 0:
+                    ax.scatter(
+                        curve.steps[index],
+                        curve.values[index],
+                        s=52,
+                        facecolor="white",
+                        edgecolor=color,
+                        linewidths=1.6,
+                        zorder=5,
+                    )
+                    ax.annotate(
+                        f"{curve.steps[index] / 1000:g}k",
+                        (curve.steps[index], curve.values[index]),
+                        textcoords="offset points",
+                        xytext=offset,
+                        fontsize=7,
+                        color=INK,
+                    )
             t_conv = marks.get(("t_conv", None))
             if t_conv is not None:
                 ax.axvline(t_conv, color=MUTED, linewidth=1.0, linestyle=(0, (1, 2)), zorder=2)
@@ -437,9 +489,14 @@ def figure_confound(
             axes,
             "Solid: the trained agent. Dashed: the frozen-policy control, identical in every "
             "respect except that no update is applied. Rings mark where the plateau detector "
-            f"fires ({pin.caption}). RND error is on a log axis. Where the two RND curves "
-            "decay alike, the detected plateau is the predictor converging rather than "
-            "novelty being exhausted; grid SVE moves only when the policy does.",
+            f"fires, labelled with the step. Setting: {pin.caption}"
+            + (f" --- {setting_note}." if setting_note else ".")
+            + " RND error is on a log axis. The two RND curves do not decay *alike* --- the "
+            "frozen one levels off several times higher --- but the detector fires at nearly "
+            "the same step in both, and that is the confound: what it responds to is the knee "
+            "of the predictor's own convergence, which happens whether or not the policy is "
+            "learning anything. Grid SVE is the contrast: under the frozen policy it does not "
+            "descend at all, so there is no knee for the detector to find.",
         )
         return _save(fig, path)
 

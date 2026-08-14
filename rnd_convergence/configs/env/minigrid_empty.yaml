@@ -7,16 +7,22 @@
 id: MiniGrid-Empty-5x5-v0
 kwargs: {}
 
-# 20 evaluation episodes rather than the 10 the other rungs use. The greedy return here is
-# all-or-nothing --- 0.955 or 0.0, depending on which start state the episode drew --- so an
-# evaluation point is a mean of Bernoulli draws, and retained = R(t_plateau) / R_ref divides
-# one such mean by a small difference of two others. At 10 episodes that ratio came out
-# between -1.26 and 4.39 across seeds, which is the estimator's noise rather than a
-# non-monotonic return curve. MiniGrid episodes are short, so the extra episodes are close to
-# free here in a way they would not be on CartPole or LunarLander.
+# 10 evaluation episodes, as on every other rung, and deliberately not more. Raising it to 20
+# was tried here to tame `retained`, which comes out between -0.24 and 4.39 across seeds, and
+# it changed nothing: with 20 episodes every value reproduced to six decimal places. The
+# measurement that explains why is the within-evaluation standard deviation, which is zero at
+# all 60 evaluation points --- Empty-5x5 starts the agent in a fixed cell and a greedy policy
+# is deterministic, so twenty episodes are one episode run twenty times. There is no sampling
+# noise here to average down.
+#
+# What is left is a property of the *policy*: between one evaluation and the next the greedy
+# argmax either solves the maze or does not, so the curve is a 0.955/0.0 sequence in time and
+# `retained` divides one two-valued number by a difference of two more. That makes `retained`
+# uninterpretable on this rung rather than noisy, which is a finding to report, not a setting
+# to spend evaluation episodes on.
 total_steps: 300_000
 eval_interval: 5_000
-eval_episodes: 20
+eval_episodes: 10
 rollout_steps: 2_048
 
 signal_window: 10_000

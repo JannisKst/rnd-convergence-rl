@@ -248,7 +248,7 @@ def bootstrap_ci(
     confidence: float = 0.95,
     seed: int = 0,
 ) -> tuple[float, float]:
-    """Stratified-bootstrap CI of the mean, or ``(nan, nan)`` below two values.
+    """Percentile-bootstrap CI of the mean over runs, or ``(nan, nan)`` below two values.
 
     The percentile bootstrap over runs --- resample the cell's runs with replacement, take
     the mean of each resample, read off the quantiles. With one task per cell this is exactly
@@ -258,7 +258,8 @@ def bootstrap_ci(
     interval then moves between two runs of the report over the same frame --- silently, and
     by a few thousand steps on a four-seed cell. A committed table cannot have that, and
     seeding a global RNG from inside a library function to work around it is worse than
-    drawing the resamples here from a generator this function owns.
+    drawing the resamples here from a generator this function owns. (That is also why
+    ``rliable`` is not a dependency of this project: nothing else here would have used it.)
 
     A single seed gets ``nan`` rather than the zero-width interval a bootstrap over one
     value returns. That interval is not narrow, it is empty --- printing ``[21116, 21116]``
@@ -310,11 +311,103 @@ def summarise_cells(
     return pd.DataFrame(rows)
 
 
+# At or below this many distinct evaluation returns, `retained` stops being a noisy estimate
+# and becomes arithmetic on a lattice: its numerator is one point of a curve with a handful of
+# levels and its denominator a difference of two more. The threshold does no delicate work,
+# because the measured distribution is bimodal --- 1 on MarsRover and DoorKey-8x8 (a constant
+# greedy return, and a rung that never scores), up to 3 on MiniGrid-Empty, against 94 on
+# CartPole and 100 on LunarLander. Any cut inside that gap gives the same answer. See
+# `eval_distinct_returns` in analysis._row.
+QUANTISED_EVAL_LEVELS = 3
+
+# Occupancy at which the grid counts as saturated: essentially every sample owning its own
+# cell, where the plug-in estimator returns log N identically and the curve stops being about
+# exploration at all. Not exactly 1.0, because occupancy is a ratio of two counts that can sit
+# a hair below it while the estimator is already pinned.
+SATURATED_OCCUPANCY = 0.999
+
+
 def delta_summary(frame: pd.DataFrame, pin: Pin, *, reps: int = 10_000) -> pd.DataFrame:
-    """The Delta table as a tidy frame: one row per ``(rung, signal)``, ladder-ordered."""
+    """The Delta table as a tidy frame: one row per ``(rung, signal)``, ladder-ordered.
+
+    Carries three quantities per cell, not one, because the README promises all three next to
+    each other and each is meaningless alone. ``Delta`` is the headline. ``occupancy`` is what
+    licenses it on the discretizing signals --- a grid-SVE plateau found where occupancy sits
+    at 1.0 is arithmetic about sample counts, so the table making a claim about 8-D has to
+    carry the number that says the estimator was not pinned at its ceiling. ``retained`` is
+    the practical cost of stopping on the signal, and it comes with the flag that says where
+    it is not interpretable at all.
+    """
     selected = select(frame, pin)
     summary = summarise_cells(selected, by=("env_id", "signal_label"), value="delta", reps=reps)
-    return _ordered(summary, frame=selected)
+    if summary.empty:
+        # A pin the frame was never swept over. Returned as the empty frame the caller checks
+        # for, rather than merged against two more empty frames that have no columns to join.
+        return summary
+    retained = summarise_cells(
+        selected, by=("env_id", "signal_label"), value="retained", reps=reps
+    ).rename(
+        columns={
+            "mean": "retained_mean",
+            "ci_low": "retained_ci_low",
+            "ci_high": "retained_ci_high",
+            "n_defined": "n_retained",
+        }
+    )
+    merged = summary.merge(
+        retained[
+            [
+                "env_id",
+                "signal_label",
+                "retained_mean",
+                "retained_ci_low",
+                "retained_ci_high",
+                "n_retained",
+            ]
+        ],
+        on=["env_id", "signal_label"],
+        how="left",
+    )
+    return _ordered(
+        merged.merge(_cell_diagnostics(selected), on=["env_id", "signal_label"]), frame=selected
+    )
+
+
+def _cell_diagnostics(selected: pd.DataFrame) -> pd.DataFrame:
+    """Per cell: occupancy where the plateau was found, and whether `retained` can mean anything.
+
+    Occupancy is averaged only over the rows that have one --- it exists on the grid signals
+    and only where a plateau was detected, so a cell's occupancy describes the seeds that fired
+    rather than the whole cell, and ``n_occupancy`` says how many those were.
+    """
+    rows = []
+    for (env, signal), group in selected.groupby(["env_id", "signal_label"], sort=False):
+        occupancy = group["occupancy_at_plateau"].dropna().astype(float)
+        # Where no seed plateaued there is no occupancy *at* a plateau, and those are exactly
+        # the cells the saturation question is sharpest for: "grid SVE never fires at 8-D" and
+        # "the 8-D grid is pinned at log N" are different claims, and only the second is a
+        # defect of the estimator. The last window's occupancy is carried as the fallback so
+        # that no discretizing cell is silent about the grid it was measured on.
+        last = group["occupancy_last"].dropna().astype(float) if "occupancy_last" in group else []
+        distinct = group.get("eval_distinct_returns")
+        rows.append(
+            {
+                "env_id": env,
+                "signal_label": signal,
+                "occupancy_mean": float(occupancy.mean()) if len(occupancy) else float("nan"),
+                "occupancy_max": float(occupancy.max()) if len(occupancy) else float("nan"),
+                "n_occupancy": int(len(occupancy)),
+                "occupancy_last_mean": float(np.mean(last)) if len(last) else float("nan"),
+                # A rung, not a cell, property --- it describes the evaluation curve --- but it
+                # travels per cell so the formatter never has to look a rung up somewhere else.
+                "quantised_eval": (
+                    bool(distinct.max() <= QUANTISED_EVAL_LEVELS)
+                    if distinct is not None and distinct.notna().any()
+                    else False
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _ordered(summary: pd.DataFrame, *, frame: pd.DataFrame) -> pd.DataFrame:
@@ -364,13 +457,28 @@ def conv_status_rates(frame: pd.DataFrame, pin: Pin) -> pd.DataFrame:
 PLATEAU_AXES: tuple[str, ...] = ("tau", "smooth_window", "reference_quantile")
 
 
-def robustness(frame: pd.DataFrame, pin: Pin, *, tag: str | None = None) -> pd.DataFrame:
+def robustness(
+    frame: pd.DataFrame,
+    pin: Pin,
+    *,
+    tag: str | None = None,
+    split_reference_quantile: bool = False,
+) -> pd.DataFrame:
     """Fraction of detector configurations in which each signal plateaus at all, per rung.
 
     A result in its own right rather than a diagnostic: a signal that only fires under one
     hand-picked ``tau`` is not a usable stopping criterion however good its ``Delta`` looks
     at that ``tau``. The denominator is the detector sweep in the frame, deduplicated onto
-    the axes ``plateau_time`` reads, times the seeds of the rung.
+    the axes ``plateau_time`` reads, times the seeds of the rung --- which is why ``n_seeds``
+    is returned beside ``fired`` and belongs next to it wherever the fraction is shown. A
+    rung measured at one seed and a rung measured at five are not the same claim.
+
+    ``split_reference_quantile`` splits the denominator by that axis instead of pooling it,
+    and the split is worth looking at: half the configurations use ``reference_quantile=1.0``,
+    the running *maximum*, which the README keeps as a sensitivity check precisely because one
+    transient spike relaxes the threshold for every later point and moves ``t_plateau``
+    earlier. A pooled rate therefore blends a candidate detector with one the project has
+    argued against, and the pooled number should not be quoted without that split to hand.
 
     The estimator axes stay pinned by ``pin`` --- this counts over detector settings, not
     over bin counts, since the bin count is a column of the table and its own axis of the
@@ -388,18 +496,90 @@ def robustness(frame: pd.DataFrame, pin: Pin, *, tag: str | None = None) -> pd.D
     configs = labelled[keep].drop_duplicates(
         subset=["env_id", "seed", "signal_label", *PLATEAU_AXES]
     )
+    group_keys = ["env_id", "signal_label"]
+    if split_reference_quantile:
+        group_keys.append("reference_quantile")
     rows = []
-    for (env, signal), group in configs.groupby(["env_id", "signal_label"], sort=False):
+    for key, group in configs.groupby(group_keys, sort=False):
         rows.append(
             {
-                "env_id": env,
-                "signal_label": signal,
+                **dict(zip(group_keys, key if isinstance(key, tuple) else (key,), strict=True)),
                 "fired": float((group["plateau_status"] == PLATEAU).mean()),
                 "n_configs": int(group.groupby(list(PLATEAU_AXES), sort=False).ngroups),
                 "n_seeds": int(group["seed"].nunique()),
             }
         )
     return _ordered(pd.DataFrame(rows), frame=configs)
+
+
+def confound_pin(
+    frame: pd.DataFrame, pin: Pin, *, env_id: str, seed: int, signal: str = RND
+) -> tuple[Pin, str]:
+    """The setting to draw the trained-vs-frozen figure at, and why it is that one.
+
+    The confound figure's whole claim is a *comparison*: the plateau lands in nearly the same
+    place whether the policy is learning or frozen, so what the detector fires on is largely
+    the predictor converging. A setting at which the control does not plateau cannot carry
+    that claim --- it draws one ring and leaves the reader to assume the second detection was
+    simply omitted. On CartPole the pinned setting is exactly such a case.
+
+    So: keep the table's pin when both conditions plateau there, and otherwise take the
+    nearest configuration in the sweep that does, "nearest" being the pinned
+    ``reference_quantile`` first (the running maximum is a sensitivity check, not a candidate
+    detector), then the smallest change in ``tau``, then in ``smooth_window``. The chosen
+    setting is returned with a sentence naming it, which the figure prints: a figure drawn at
+    a different setting from the table beside it has to say so, or it is the same silent
+    mismatch in a new place.
+    """
+    labelled = with_signal_labels(frame)
+    rows = labelled[
+        (labelled["env_id"] == env_id)
+        & (labelled["seed"] == seed)
+        & (labelled["signal_label"] == signal)
+        & (labelled["conv_smooth_window"] == pin.detector.conv_smooth_window)
+        & (labelled["mode"] == pin.mode)
+        & _matches(labelled["analysis_seed"], pin.analysis_seed)
+    ]
+    detector = pin.detector
+    both = [
+        (tau, smooth, quantile)
+        for (tau, smooth, quantile), group in rows.groupby(list(PLATEAU_AXES), sort=False)
+        if set(group.loc[group["plateau_status"] == PLATEAU, "frozen"]) >= {False, True}
+    ]
+    if (detector.tau, detector.smooth_window, detector.reference_quantile) in both:
+        return pin, "the same setting as the table"
+    if not both:
+        return pin, (
+            "the table's setting; no configuration in the sweep detects a plateau in both "
+            "conditions, so the control's non-detection is marked on the panel"
+        )
+    tau, smooth, quantile = min(
+        both,
+        key=lambda candidate: (
+            candidate[2] != detector.reference_quantile,
+            abs(candidate[0] - detector.tau),
+            abs(candidate[1] - detector.smooth_window),
+            candidate,
+        ),
+    )
+    chosen = Pin(
+        detector=DetectorSpec(
+            tau=tau,
+            smooth_window=int(smooth),
+            reference_quantile=quantile,
+            conv_smooth_window=detector.conv_smooth_window,
+        ),
+        mode=pin.mode,
+        clip=pin.clip,
+        correction=pin.correction,
+        analysis_seed=pin.analysis_seed,
+    )
+    return chosen, (
+        f"not the table's setting (tau={detector.tau:g}, "
+        f"smooth_window={detector.smooth_window}) but the nearest one in the sweep at which "
+        "the detector fires on the control as well as on the trained run, which is what makes "
+        "the two comparable"
+    )
 
 
 def delta_band(frame: pd.DataFrame, pin: Pin, *, tag: str | None = None) -> pd.DataFrame:
@@ -489,7 +669,13 @@ def tracking_sweep(frame: pd.DataFrame, pin: Pin, tags: Sequence[str]) -> pd.Dat
                 **_paired_stats(group),
             }
         )
-    return pd.DataFrame(rows).sort_values(["signal_label", *PLATEAU_AXES]).reset_index(drop=True)
+    swept = pd.DataFrame(rows)
+    # Ordered by bin count rather than lexically, so the summary line under the table reads
+    # b5, b10, b20 like every other table in the document.
+    swept["signal_label"] = pd.Categorical(
+        swept["signal_label"], categories=signal_order(swept), ordered=True
+    )
+    return swept.sort_values(["signal_label", *PLATEAU_AXES]).reset_index(drop=True)
 
 
 def _paired_stats(group: pd.DataFrame) -> dict[str, Any]:
@@ -557,21 +743,58 @@ def discrimination_summary(frame: pd.DataFrame, pin: Pin, tags: Sequence[str]) -
     summary = pd.DataFrame(rows)
     if summary.empty:
         return summary
-    order = [label for label in (RND, *sorted(set(summary["signal_label"]) - {RND, SVE_KNN}))]
-    order += [SVE_KNN] if SVE_KNN in set(summary["signal_label"]) else []
-    summary["signal_label"] = pd.Categorical(summary["signal_label"], categories=order)
+    # Ordered by bin count like every other table, not lexically: b10 before b5 reads as a
+    # sort nobody chose, and the bin count is the axis the reader is scanning down.
+    summary["signal_label"] = pd.Categorical(
+        summary["signal_label"],
+        categories=signal_order(summary),
+        ordered=True,
+    )
     return summary.sort_values(["tag", "signal_label"]).reset_index(drop=True)
 
 
 def _format_cell(row: pd.Series) -> str:
-    """One Delta cell: the mean, its interval, and what it was computed over."""
+    """One Delta cell: the mean, its interval, and everything needed to read it.
+
+    Four facts, because each disarms a way of misreading the others. The mean and its
+    interval; how many seeds plateaued at this setting (a mean over two of five seeds is a
+    different claim from one over five); the occupancy of the grid where those plateaus were
+    found, without which a grid-SVE number at 8-D cannot be told from ``log N``; and
+    ``retained``, the cost of actually stopping there, suppressed where the evaluation curve
+    is quantised and the ratio is arithmetic rather than measurement.
+
+    A cell with no ``Delta`` still prints the last three. The cells that carry no Delta at 8-D
+    are precisely the ones the saturation question is asked of, so a bare dash there would
+    withhold the evidence exactly where it is load-bearing.
+    """
+    lines = []
     if row["n_defined"] == 0:
-        return "—"
-    mean = _steps(row["mean"])
-    interval = (
-        "" if np.isnan(row["ci_low"]) else f" [{_steps(row['ci_low'])}, {_steps(row['ci_high'])}]"
+        lines.append("—")
+    else:
+        interval = (
+            ""
+            if np.isnan(row["ci_low"])
+            else f" [{_steps(row['ci_low'])}, {_steps(row['ci_high'])}]"
+        )
+        lines.append(f"{_steps(row['mean'])}{interval} ({row['n_defined']}/{row['n_runs']})")
+    lines.append(
+        f"plateau in {int(round(row['plateau_rate'] * row['n_runs']))}/{row['n_runs']} seeds"
     )
-    return f"{mean}{interval} ({row['n_defined']}/{row['n_runs']})"
+    if row["n_occupancy"] > 0:
+        occupancy = f"occ {row['occupancy_mean']:.3f}"
+        if row["occupancy_max"] >= SATURATED_OCCUPANCY:
+            # Saturated: the estimator is pinned at log N and the plateau is arithmetic.
+            occupancy += " — SATURATED"
+        lines.append(occupancy)
+    elif not np.isnan(row["occupancy_last_mean"]):
+        occupancy = f"occ {row['occupancy_last_mean']:.3f} (last window)"
+        if row["occupancy_last_mean"] >= SATURATED_OCCUPANCY:
+            occupancy += " — SATURATED"
+        lines.append(occupancy)
+    if row["n_retained"] > 0:
+        retained = f"retained {row['retained_mean']:.2f} ({row['n_retained']}/{row['n_runs']})"
+        lines.append("retained n/a" if row["quantised_eval"] else retained)
+    return "<br>".join(lines)
 
 
 def _steps(value: float) -> str:
@@ -604,10 +827,10 @@ def format_delta_table(
     cells = summary.copy()
     cells["cell"] = cells.apply(_format_cell, axis=1)
     pivot = cells.pivot(index="env_id", columns="signal_label", values="cell")
-    plateau = cells.pivot(index="env_id", columns="signal_label", values="plateau_rate")
+    seeds = cells.groupby("env_id", observed=True)["n_runs"].max()
     conv = conv.set_index("env_id")
 
-    header = ["Rung", "Dim", "t_conv"] + signals
+    header = ["Rung", "Dim", "Seeds", "t_conv"] + signals
     lines = [f"### {title}", "", "| " + " | ".join(header) + " |"]
     lines.append("| " + " | ".join("---" for _ in header) + " |")
     for env in pivot.index:
@@ -616,25 +839,46 @@ def format_delta_table(
         conv_cell = (
             f"{statuses['n_converged']}/{statuses['n_runs']}" if statuses is not None else "—"
         )
-        row = [display, str(dim) if dim is not None else "—", conv_cell]
+        row = [
+            display,
+            str(dim) if dim is not None else "—",
+            str(int(seeds.get(env, 0))),
+            conv_cell,
+        ]
         for signal in signals:
             value = pivot.loc[env, signal]
-            rate = plateau.loc[env, signal]
-            row.append(
-                "—" if not isinstance(value, str) else f"{value}<br>fired {rate:.0%} of seeds"
-            )
+            row.append("—" if not isinstance(value, str) else value)
         lines.append("| " + " | ".join(row) + " |")
 
     lines += [
         "",
         f"Detector and estimator settings, identical for every signal: {pin.caption}.",
         "",
-        "Cells are `mean Delta [95% bootstrap CI] (seeds with a Delta / seeds run)`; the CI is "
-        "a stratified bootstrap over seeds (rliable) and is omitted below two seeds. `t_conv` "
-        "counts the runs of the rung that reached the convergence criterion --- where none "
-        "did, no cell in the row can hold a Delta, and the reason is in the status table "
-        "below. Delta < 0 means the signal fires before the policy converged, so stopping on "
-        "it costs return; Delta > 0 means it fires late and saves no compute.",
+        "Each cell reads `mean Delta [95% CI] (seeds with a Delta / seeds run)`, then how many "
+        "of the rung's seeds plateaued **at this setting** --- not to be confused with the "
+        "robustness table below, which counts detector configurations across the sweep --- "
+        "then, on the discretizing signals, the mean occupancy of the grid where those "
+        "plateaus were found, and last `retained`, the fraction of final performance kept by "
+        "stopping there. The interval is a percentile bootstrap of the mean over seeds "
+        "(10 000 resamples, seeded) and is omitted below two seeds, since a bootstrap over one "
+        "value returns a zero-width interval rather than a narrow one.",
+        "",
+        "`Seeds` is the number of runs behind the row and belongs with every number in it. "
+        "`t_conv` counts the runs that reached the convergence criterion --- where none did, "
+        "no cell in the row can hold a Delta, and the reason is in the status table below. "
+        "Delta < 0 means the signal fires before the policy converged, so stopping on it "
+        "costs return; Delta > 0 means it fires late and saves no compute. `occ` is "
+        "`occupancy_at_plateau`: at 1.0 the grid is saturated, the estimator is pinned to "
+        "`log N` whatever the policy does, and the plateau above it is arithmetic about "
+        "sample counts rather than evidence about exploration --- such cells are marked "
+        "SATURATED --- and where a cell has no plateau at all, the last window's occupancy "
+        'is shown instead, since "the grid was saturated" and "the detector never fired" '
+        "are different claims and only the first is a defect of the estimator. "
+        "`retained n/a` marks a rung whose evaluation curve takes at most "
+        f"{QUANTISED_EVAL_LEVELS} distinct values (`eval_distinct_returns`): there the ratio "
+        "divides one point of a handful-of-levels curve by a difference of two more, which is "
+        "an arithmetic artefact rather than a noisy estimate. The rungs split cleanly, 1-3 "
+        "levels against 94-100.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -653,24 +897,30 @@ def format_status_table(conv: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_robustness_table(fired: pd.DataFrame) -> str:
+def format_robustness_table(fired: pd.DataFrame, by_quantile: pd.DataFrame | None = None) -> str:
     """Detector robustness as a table, so the figure has a readable companion."""
     if fired.empty:
         return "### Detector robustness\n\n(no rows)\n"
     signals = [str(label) for label in fired["signal_label"].cat.categories]
     pivot = fired.pivot(index="env_id", columns="signal_label", values="fired")
-    counts = fired.set_index(["env_id", "signal_label"])[["n_configs", "n_seeds"]]
 
     lines = [
         "### Detector robustness: fraction of configurations in which the signal plateaus",
         "",
-        "| Rung | Dim | Configs | " + " | ".join(signals) + " |",
-        "| " + " | ".join("---" for _ in range(3 + len(signals))) + " |",
+        "| Rung | Dim | Seeds | Configs | " + " | ".join(signals) + " |",
+        "| " + " | ".join("---" for _ in range(4 + len(signals))) + " |",
     ]
     for env in pivot.index:
         display, dim = rung_display(str(env))
-        first = counts.loc[env].iloc[0]
-        row = [display, str(dim) if dim is not None else "—", f"{first['n_configs']}"]
+        cells = fired[fired["env_id"] == env]
+        row = [
+            display,
+            str(dim) if dim is not None else "—",
+            _one_or_range(cells["n_seeds"]),
+            # Per rung rather than off the first signal's row: they should agree, and where
+            # they do not the reader is looking at cells with different denominators.
+            _one_or_range(cells["n_configs"]),
+        ]
         row += [
             "—" if pd.isna(pivot.loc[env, signal]) else f"{pivot.loc[env, signal]:.2f}"
             for signal in signals
@@ -680,13 +930,53 @@ def format_robustness_table(fired: pd.DataFrame) -> str:
         "",
         "Fraction over the detector sweep (tau x smooth_window x reference_quantile) times "
         "the seeds of the rung; estimator settings pinned. 1.00 means the signal plateaued "
-        "under every configuration tried.",
+        "under every configuration tried. `Seeds` is the denominator's other half and is the "
+        "reason these numbers are a trend rather than a measurement: a rung at one seed says "
+        "much less than a rung at five.",
+        "",
+        "Note what half the denominator is. Nine of the eighteen configurations use "
+        "`reference_quantile = 1.0`, the running maximum, which this project keeps as a "
+        "sensitivity check rather than as a candidate detector --- one transient spike "
+        "relaxes its threshold for every later point, and it fires systematically early. The "
+        "split below separates the two so the pooled rate is never read as the rate of a "
+        "detector anyone proposes using.",
     ]
+    if by_quantile is not None and not by_quantile.empty:
+        lines += ["", _quantile_split(by_quantile, signals)]
     return "\n".join(lines) + "\n"
 
 
+def _quantile_split(by_quantile: pd.DataFrame, signals: Sequence[str]) -> str:
+    """The robustness rates split by ``reference_quantile``, as a nested Markdown table."""
+    lines = [
+        "| Rung | reference_quantile | " + " | ".join(signals) + " |",
+        "| " + " | ".join("---" for _ in range(2 + len(signals))) + " |",
+    ]
+    for env in by_quantile["env_id"].drop_duplicates():
+        display, _ = rung_display(str(env))
+        for quantile in sorted(by_quantile["reference_quantile"].unique()):
+            cells = by_quantile[
+                (by_quantile["env_id"] == env) & (by_quantile["reference_quantile"] == quantile)
+            ].set_index("signal_label")["fired"]
+            row = [display, f"{quantile:g} ({'median' if quantile < 1 else 'maximum'})"]
+            row += [
+                "—" if signal not in cells.index else f"{cells[signal]:.2f}" for signal in signals
+            ]
+            lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _one_or_range(values: pd.Series) -> str:
+    """``"18"`` where every cell agrees, ``"12-18"`` where they do not."""
+    unique = sorted(set(int(value) for value in values))
+    return str(unique[0]) if len(unique) == 1 else f"{unique[0]}-{unique[-1]}"
+
+
 def format_discrimination_table(
-    summary: pd.DataFrame, pin: Pin, tracked: pd.DataFrame | None = None
+    summary: pd.DataFrame,
+    pin: Pin,
+    tracked: pd.DataFrame | None = None,
+    swept: pd.DataFrame | None = None,
 ) -> str:
     """``t_conv`` vs ``t_plateau`` across run conditions, as Markdown."""
     if summary.empty:
@@ -720,11 +1010,10 @@ def format_discrimination_table(
                 else f"{row['spearman']:+.2f} (p={row['p_value']:.2f})"
             )
             slope = "—" if np.isnan(row["slope"]) else f"{row['slope']:+.2f}"
-            conv_range = _mean_sd(row["t_conv_range"], float("nan"), 1, 1)
-            plateau_range = _mean_sd(row["t_plateau_range"], float("nan"), 1, 1)
             lines.append(
-                f"| {row['signal_label']} | {row['n_pairs']}/{row['n_runs']} | {conv_range} "
-                f"| {plateau_range} | {rho} | {slope} |"
+                f"| {row['signal_label']} | {row['n_pairs']}/{row['n_runs']} "
+                f"| {_span(row['t_conv_range'])} | {_span(row['t_plateau_range'])} "
+                f"| {rho} | {slope} |"
             )
         lines += [
             "",
@@ -735,8 +1024,44 @@ def format_discrimination_table(
             "tracks, near 0 it is stably wrong. Both are undefined where fewer than three "
             "runs have both times, or where either time never moved.",
         ]
+        if swept is not None and not swept.empty:
+            lines += ["", _sweep_sentence(swept)]
     lines += ["", f"Settings: {pin.caption}."]
     return "\n".join(lines) + "\n"
+
+
+def _span(value: float) -> str:
+    """A range of step counts, or a dash where there were none to take a range over."""
+    return "—" if np.isnan(value) else f"{value:,.0f}".replace(",", " ")
+
+
+def _sweep_sentence(swept: pd.DataFrame) -> str:
+    """One line summarising :func:`tracking_sweep`, which is the answer the table implies.
+
+    The pinned row is one cell of eighteen, and picking the cell that answers most favourably
+    is exactly the failure this study is built to avoid. So the sweep's own distribution ---
+    how many configurations agree in sign, how many reach significance, and what the typical
+    slope is --- is printed under the table rather than left in a CSV.
+    """
+    usable = swept[swept["slope"].notna()]
+    if usable.empty:
+        return (
+            "Across the detector sweep no configuration has three runs with both times, so "
+            "the pinned row is the only reading available."
+        )
+    parts = []
+    for signal, group in usable.groupby("signal_label", sort=False, observed=True):
+        parts.append(
+            f"{signal}: rho > 0 in {int((group['spearman'] > 0).sum())}/{len(group)} "
+            f"configurations, p < 0.05 in {int((group['p_value'] < 0.05).sum())}, median slope "
+            f"{group['slope'].median():+.2f}"
+        )
+    return (
+        "Across the whole detector sweep rather than at the pinned setting --- "
+        + "; ".join(parts)
+        + ". A signal whose slope is near zero at most settings is not tracking convergence "
+        "at the one where it looks like it is. Full table in tracking_sweep.csv."
+    )
 
 
 def _mean_sd(mean: float, sd: float, defined: int, total: int) -> str:
