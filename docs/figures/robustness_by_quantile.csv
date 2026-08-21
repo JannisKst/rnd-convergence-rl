@@ -1,51 +1,41 @@
 env_id,signal_label,reference_quantile,fired,n_configs,n_seeds
-MarsRover,RND,0.5,1.0,9,1
-MarsRover,RND,1.0,1.0,9,1
-MarsRover,SVE grid b5,0.5,1.0,9,1
-MarsRover,SVE grid b5,1.0,1.0,9,1
-MarsRover,SVE grid b10,0.5,1.0,9,1
-MarsRover,SVE grid b10,1.0,1.0,9,1
-MarsRover,SVE grid b20,0.5,1.0,9,1
-MarsRover,SVE grid b20,1.0,1.0,9,1
-MarsRover,SVE kNN,0.5,0.6666666666666666,9,1
-MarsRover,SVE kNN,1.0,1.0,9,1
-MiniGrid-Empty-5x5-v0,RND,0.5,0.9555555555555556,9,5
-MiniGrid-Empty-5x5-v0,RND,1.0,1.0,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b5,0.5,0.3333333333333333,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b5,1.0,1.0,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b10,0.5,0.2222222222222222,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b10,1.0,0.9555555555555556,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b20,0.5,0.2222222222222222,9,5
-MiniGrid-Empty-5x5-v0,SVE grid b20,1.0,0.9333333333333333,9,5
-MiniGrid-Empty-5x5-v0,SVE kNN,0.5,0.0,9,5
-MiniGrid-Empty-5x5-v0,SVE kNN,1.0,0.4444444444444444,9,5
-MiniGrid-DoorKey-8x8-v0,RND,0.5,0.8888888888888888,9,1
-MiniGrid-DoorKey-8x8-v0,RND,1.0,1.0,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b5,0.5,0.1111111111111111,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b5,1.0,1.0,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b10,0.5,0.1111111111111111,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b10,1.0,0.8888888888888888,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b20,0.5,0.0,9,1
-MiniGrid-DoorKey-8x8-v0,SVE grid b20,1.0,0.6666666666666666,9,1
-MiniGrid-DoorKey-8x8-v0,SVE kNN,0.5,0.0,9,1
-MiniGrid-DoorKey-8x8-v0,SVE kNN,1.0,0.6666666666666666,9,1
-CartPole-v1,RND,0.5,1.0,9,1
-CartPole-v1,RND,1.0,1.0,9,1
-CartPole-v1,SVE grid b5,0.5,0.5555555555555556,9,1
-CartPole-v1,SVE grid b5,1.0,1.0,9,1
-CartPole-v1,SVE grid b10,0.5,0.3333333333333333,9,1
-CartPole-v1,SVE grid b10,1.0,1.0,9,1
-CartPole-v1,SVE grid b20,0.5,0.2222222222222222,9,1
-CartPole-v1,SVE grid b20,1.0,0.7777777777777778,9,1
-CartPole-v1,SVE kNN,0.5,0.2222222222222222,9,1
-CartPole-v1,SVE kNN,1.0,0.7777777777777778,9,1
-LunarLander-v3,RND,0.5,0.6666666666666666,9,1
-LunarLander-v3,RND,1.0,1.0,9,1
-LunarLander-v3,SVE grid b5,0.5,0.0,9,1
-LunarLander-v3,SVE grid b5,1.0,0.6666666666666666,9,1
-LunarLander-v3,SVE grid b10,0.5,0.0,9,1
-LunarLander-v3,SVE grid b10,1.0,0.6666666666666666,9,1
-LunarLander-v3,SVE grid b20,0.5,0.1111111111111111,9,1
-LunarLander-v3,SVE grid b20,1.0,0.7777777777777778,9,1
-LunarLander-v3,SVE kNN,0.5,0.0,9,1
-LunarLander-v3,SVE kNN,1.0,1.0,9,1
+MarsRover,RND,0.5,1.0,9,10
+MarsRover,RND,1.0,1.0,9,10
+MarsRover,SVE grid b5,0.5,1.0,9,10
+MarsRover,SVE grid b5,1.0,1.0,9,10
+MarsRover,SVE grid b10,0.5,0.8888888888888888,9,10
+MarsRover,SVE grid b10,1.0,1.0,9,10
+MarsRover,SVE grid b20,0.5,0.9333333333333333,9,10
+MarsRover,SVE grid b20,1.0,1.0,9,10
+MarsRover,SVE kNN,0.5,0.7666666666666667,9,10
+MarsRover,SVE kNN,1.0,1.0,9,10
+MiniGrid-Empty-5x5-v0,RND,0.5,0.9333333333333333,9,10
+MiniGrid-Empty-5x5-v0,RND,1.0,1.0,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b5,0.5,0.3888888888888889,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b5,1.0,0.9888888888888889,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b10,0.5,0.28888888888888886,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b10,1.0,0.9444444444444444,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b20,0.5,0.3111111111111111,9,10
+MiniGrid-Empty-5x5-v0,SVE grid b20,1.0,0.9111111111111111,9,10
+MiniGrid-Empty-5x5-v0,SVE kNN,0.5,0.044444444444444446,9,10
+MiniGrid-Empty-5x5-v0,SVE kNN,1.0,0.6888888888888889,9,10
+CartPole-v1,RND,0.5,0.9666666666666667,9,10
+CartPole-v1,RND,1.0,1.0,9,10
+CartPole-v1,SVE grid b5,0.5,0.28888888888888886,9,10
+CartPole-v1,SVE grid b5,1.0,1.0,9,10
+CartPole-v1,SVE grid b10,0.5,0.16666666666666666,9,10
+CartPole-v1,SVE grid b10,1.0,0.9555555555555556,9,10
+CartPole-v1,SVE grid b20,0.5,0.15555555555555556,9,10
+CartPole-v1,SVE grid b20,1.0,0.8666666666666667,9,10
+CartPole-v1,SVE kNN,0.5,0.07777777777777778,9,10
+CartPole-v1,SVE kNN,1.0,0.6222222222222222,9,10
+LunarLander-v3,RND,0.5,0.6444444444444445,9,10
+LunarLander-v3,RND,1.0,1.0,9,10
+LunarLander-v3,SVE grid b5,0.5,0.12222222222222222,9,10
+LunarLander-v3,SVE grid b5,1.0,0.8111111111111111,9,10
+LunarLander-v3,SVE grid b10,0.5,0.14444444444444443,9,10
+LunarLander-v3,SVE grid b10,1.0,0.8,9,10
+LunarLander-v3,SVE grid b20,0.5,0.08888888888888889,9,10
+LunarLander-v3,SVE grid b20,1.0,0.8111111111111111,9,10
+LunarLander-v3,SVE kNN,0.5,0.1111111111111111,9,10
+LunarLander-v3,SVE kNN,1.0,0.8333333333333334,9,10

@@ -25,6 +25,7 @@ from torch import nn
 
 from rnd_convergence.networks import Policy, ValueNetwork
 from rnd_convergence.streams import EvalCurve, StateFn, StateStream, compact_state_fn
+from tqdm import tqdm
 
 
 @dataclass
@@ -395,44 +396,52 @@ class PPOAgent:
         eval_returns: list[np.ndarray] = []
         next_eval = eval_interval
 
-        while self.global_step < total_steps:
-            rollout = self.collect_rollout(min(self.rollout_steps, total_steps - self.global_step))
-            losses = (
-                {
-                    "policy_loss": float("nan"),
-                    "value_loss": float("nan"),
-                    "entropy": self.policy_entropy(rollout.observations),
-                }
-                if freeze_policy
-                else self.update(rollout)
-            )
+        with tqdm(
+            total=total_steps,
+            initial=self.global_step,
+            desc=f"Training (seed={self.seed})",
+            unit="steps",
+        ) as pbar:
+            while self.global_step < total_steps:
+                previous_step = self.global_step
+                rollout = self.collect_rollout(min(self.rollout_steps, total_steps - self.global_step))
+                losses = (
+                    {
+                        "policy_loss": float("nan"),
+                        "value_loss": float("nan"),
+                        "entropy": self.policy_entropy(rollout.observations),
+                    }
+                    if freeze_policy
+                    else self.update(rollout)
+                )
 
-            # Keep the per-update diagnostics. A run in a job array that produces a
-            # never-converging return curve is otherwise impossible to triage after the
-            # fact: a collapsed entropy and a diverging value loss say very different
-            # things about why, and neither is recoverable from the logged artefacts.
-            self.update_log.append(
-                {"step": float(self.global_step), "mean_reward": float(rollout.rewards.mean())}
-                | losses
-            )
+                # Keep the per-update diagnostics. A run in a job array that produces a
+                # never-converging return curve is otherwise impossible to triage after the
+                # fact: a collapsed entropy and a diverging value loss say very different
+                # things about why, and neither is recoverable from the logged artefacts.
+                self.update_log.append(
+                    {"step": float(self.global_step), "mean_reward": float(rollout.rewards.mean())}
+                    | losses
+                )
 
-            state_chunks.append(rollout.states)
-            step_chunks.append(rollout.steps)
-            end_chunks.append(rollout.dones)
+                state_chunks.append(rollout.states)
+                step_chunks.append(rollout.steps)
+                end_chunks.append(rollout.dones)
 
-            if self.global_step >= next_eval:
-                # Record the step the policy was *actually* evaluated at, not the grid
-                # point that triggered it. Evaluation can only happen on a rollout
-                # boundary, so the two differ by up to rollout_steps - 1 -- always in the
-                # same direction, which would put a systematic offset straight into
-                # Delta = t_plateau - t_conv, the one quantity this project reports.
-                eval_steps.append(self.global_step)
-                eval_returns.append(self.evaluate(eval_episodes))
-                # Skip past every grid point this rollout jumped over rather than
-                # re-evaluating an unchanged policy once per point: those duplicates
-                # would satisfy the "5 consecutive evaluations" patience criterion in
-                # convergence_time for free.
-                next_eval += eval_interval * (1 + (self.global_step - next_eval) // eval_interval)
+                if self.global_step >= next_eval:
+                    # Record the step the policy was *actually* evaluated at, not the grid
+                    # point that triggered it. Evaluation can only happen on a rollout
+                    # boundary, so the two differ by up to rollout_steps - 1 -- always in the
+                    # same direction, which would put a systematic offset straight into
+                    # Delta = t_plateau - t_conv, the one quantity this project reports.
+                    eval_steps.append(self.global_step)
+                    eval_returns.append(self.evaluate(eval_episodes))
+                    # Skip past every grid point this rollout jumped over rather than
+                    # re-evaluating an unchanged policy once per point: those duplicates
+                    # would satisfy the "5 consecutive evaluations" patience criterion in
+                    # convergence_time for free.
+                    next_eval += eval_interval * (1 + (self.global_step - next_eval) // eval_interval)
+                pbar.update(self.global_step - previous_step)
 
         stream = StateStream(
             steps=np.concatenate(step_chunks),

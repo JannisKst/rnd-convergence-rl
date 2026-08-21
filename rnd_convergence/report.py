@@ -464,7 +464,9 @@ def robustness(
     tag: str | None = None,
     split_reference_quantile: bool = False,
 ) -> pd.DataFrame:
-    """Fraction of detector configurations in which each signal plateaus at all, per rung.
+    """
+    Fraction of detector configurations in which each signal plateaus,
+    considering only runs for which the policy actually converged.
 
     A result in its own right rather than a diagnostic: a signal that only fires under one
     hand-picked ``tau`` is not a usable stopping criterion however good its ``Delta`` looks
@@ -492,6 +494,7 @@ def robustness(
         & _matches(labelled["analysis_seed"], pin.analysis_seed)
         & (~labelled["frozen"])
         & _tag_filter(labelled, tag)
+        & (labelled["conv_status"] == "converged")
     )
     configs = labelled[keep].drop_duplicates(
         subset=["env_id", "seed", "signal_label", *PLATEAU_AXES]
@@ -602,9 +605,8 @@ def delta_band(frame: pd.DataFrame, pin: Pin, *, tag: str | None = None) -> pd.D
         & _tag_filter(labelled, tag)
         & labelled["delta"].notna()
     )
-    columns = ["env_id", "seed", "signal_label", "delta", *PLATEAU_AXES]
+    columns = ["env_id", "seed", "signal_label", "delta", "total_steps", *PLATEAU_AXES]
     return _ordered(labelled.loc[keep, columns].copy(), frame=labelled[keep])
-
 
 def tracking(frame: pd.DataFrame, pin: Pin, tags: Sequence[str]) -> pd.DataFrame:
     """Per signal: how strongly ``t_plateau`` moves with ``t_conv`` across run conditions.

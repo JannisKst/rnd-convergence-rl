@@ -135,7 +135,7 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
     values = fired.set_index(["env_id", "signal_label"])["fired"]
 
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(1.55 * len(envs) + 2.4, 4.0))
+        fig, ax = plt.subplots(figsize=(1.55 * len(envs) + 2.4, 3.0))
         width = 0.8 / max(len(signals), 1)
         for index, signal in enumerate(signals):
             offsets = np.arange(len(envs)) + (index - (len(signals) - 1) / 2) * width
@@ -148,7 +148,7 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
                 label=signal,
                 zorder=3,
             )
-            for offset, height in zip(offsets, heights, strict=True):
+            """for offset, height in zip(offsets, heights, strict=True):
                 if not np.isnan(height):
                     ax.text(
                         offset,
@@ -158,21 +158,20 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
                         va="bottom",
                         fontsize=6.5,
                         color=INK,
-                    )
+                    )"""
 
         seeds = fired.groupby("env_id", observed=True)["n_seeds"].max()
         ax.set_xticks(np.arange(len(envs)))
         ax.set_xticklabels([_rung_tick(env, int(seeds.get(env, 0))) for env in envs])
         ax.set_ylim(0, 1.18)
         ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
-        ax.set_ylabel("fraction of detector configurations\nin which the signal plateaus")
-        ax.set_xlabel("rung of the ladder (state dimensionality)")
+        ax.set_ylabel("fraction of signal plateaus")
         ax.set_axisbelow(True)
         ax.grid(axis="x", visible=False)
         ax.axhline(1.0, color=MUTED, linewidth=0.8, linestyle=(0, (4, 3)), zorder=2)
         ax.legend(ncols=len(signals), loc="upper center", bbox_to_anchor=(0.5, 1.13))
-        ax.set_title("Robustness of the plateau detector, by signal and rung", loc="left", pad=28)
-        _caption(
+        # ax.set_title("Robustness of the plateau detector, by signal and rung", loc="left", pad=28)
+        """_caption(
             fig,
             ax,
             "Fraction over the detector sweep (tau x smooth_window x reference_quantile) and "
@@ -183,7 +182,7 @@ def figure_robustness(fired: pd.DataFrame, path: Path, *, pin: Pin) -> Path:
             "robustness_by_quantile.csv carries the rates split by it. Estimator settings: "
             f"mode={pin.mode}, clip={pin.clip:g}, correction={pin.correction}, "
             f"analysis_seed={pin.analysis_seed}.",
-        )
+        )"""
         return _save(fig, path)
 
 
@@ -212,73 +211,79 @@ def _decades(limit: float) -> list[int]:
 def figure_delta_sensitivity(
     band: pd.DataFrame, path: Path, *, pin: Pin, omitted: Sequence[str] = ()
 ) -> Path:
-    """The spread of Delta across the detector sweep, per rung and signal.
+    """Show the mean normalized Delta and its standard deviation across runs.
 
-    One row per ``(rung, signal)``: the full range as a rule, the median as a marker, and one
-    faint dot per ``(seed, detector configuration)``. A single number per cell would not
-    survive contact with this spread --- on CartPole the RND cell alone runs from a few
-    hundred steps early to tens of thousands late --- so the table's pinned value is drawn on
-    top of the band it was taken from rather than instead of it.
+    One row is shown for each ``(environment, signal)`` combination. The marker denotes
+    the mean normalized temporal deviation, while the horizontal error bar shows one
+    standard deviation across the available runs and detector configurations.
 
-    ``omitted`` names rungs that produced no ``Delta`` at all --- a rung whose runs never
-    converged has nothing to plot here, and a figure that simply lacked its row would read as
-    a rung that was never run.
+    ``omitted`` names environments that produced no ``Delta`` values. Such environments
+    have no convergence estimate to plot and are therefore omitted from the figure.
     """
+    band = band.copy()
+    band["delta_norm"] = band["delta"] / band["total_steps"]
+
     envs = [str(env) for env in ladder_order(band)]
     rows: list[tuple[str, str]] = []
     for env in envs:
         for signal in signal_order(band[band["env_id"] == env]):
             rows.append((env, signal))
 
-    jitter = np.random.default_rng(0)
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(8.2, 0.34 * len(rows) + 2.2))
+        fig, ax = plt.subplots(figsize=(7, 0.3 * len(rows)))
         seen: set[str] = set()
         for position, (env, signal) in enumerate(rows):
             values = band.loc[
-                (band["env_id"] == env) & (band["signal_label"] == signal), "delta"
-            ].to_numpy(dtype=float)
+                (band["env_id"] == env) & (band["signal_label"] == signal), "delta_norm"
+            ].dropna().to_numpy(dtype=float)
             if values.size == 0:
                 continue
+
+            mean = float(np.mean(values))
+            std = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+
             color = color_for(signal)
             y = len(rows) - 1 - position
-            ax.hlines(y, values.min(), values.max(), color=color, linewidth=2.0, zorder=3)
-            ax.scatter(
-                values,
-                y + jitter.uniform(-0.16, 0.16, size=values.size),
-                s=7,
-                color=color,
-                alpha=0.35,
-                linewidths=0,
-                zorder=4,
+
+            ax.errorbar(
+                mean, 
+                y, 
+                xerr=std,
+                fmt="none",
+                ecolor=color,
+                elinewidth=1.5,
+                capsize=3,
+                capthick=1.5,
+                zorder=3,
             )
+
             ax.scatter(
-                np.median(values),
+                mean,
                 y,
-                s=42,
+                s=36,
                 color=color,
                 marker=marker_for(signal),
                 edgecolors="white",
-                linewidths=0.9,
-                zorder=5,
+                linewidths=0.8,
+                zorder=4,
                 label=signal if signal not in seen else None,
             )
+
             seen.add(signal)
 
         ax.set_yticks(range(len(rows)))
-        ax.set_yticklabels([signal for _, signal in reversed(rows)], fontsize=8)
+        ax.set_yticklabels([signal for _, signal in reversed(rows)], fontsize=9)
+
         ax.axvline(0, color=MUTED, linewidth=1.0, zorder=2)
-        ax.set_xscale("symlog", linthresh=SYMLOG_THRESHOLD)
-        # Ticks at the decades and at zero only. Symlog's default puts a tick at each end of
-        # the linear region as well, which lands +/-1000 on top of the zero label. The two
-        # sides are extended independently: Delta is overwhelmingly positive here, and a
-        # symmetric axis would spend its left half on a decade nothing occupies.
-        values = band["delta"].to_numpy(dtype=float)
-        negative = _decades(-values.min())
-        positive = _decades(values.max())
-        ax.set_xticks([-value for value in reversed(negative)] + [0] + positive)
-        ax.xaxis.set_major_formatter(_thousands)
-        ax.set_xlabel("Delta = t_plateau - t_conv  (environment steps, symmetric log)")
+        values = band["delta_norm"].dropna().to_numpy(dtype=float)
+
+        lower = min(-0.05, float(values.min()))
+        upper = max(0.05, float(values.max()))
+        padding = 0.05 * (upper - lower)
+        ax.set_xlim(lower - padding, upper + padding)
+
+        ax.xaxis.set_major_formatter(lambda x, pos: f"{x:.1f}")
+        ax.set_xlabel("$\Delta_{\mathrm{norm}} = (t_{\mathrm{plateau}} - t_{\mathrm{conv}}) / T$", fontsize=10)
         ax.set_ylim(-0.8, len(rows) - 0.2)
         ax.grid(axis="y", visible=False)
         ax.set_axisbelow(True)
@@ -289,7 +294,7 @@ def figure_delta_sensitivity(
             index for index in range(1, len(rows)) if rows[index][0] != rows[index - 1][0]
         ]
         for index in boundaries:
-            ax.axhline(len(rows) - 0.5 - index, color=GRID, linewidth=0.8, zorder=1)
+            ax.axhline(len(rows) - 0.5 - index, color=GRID, linewidth=0.6, zorder=1)
         for env in envs:
             positions = [i for i, (candidate, _) in enumerate(rows) if candidate == env]
             if not positions:
@@ -303,11 +308,11 @@ def figure_delta_sensitivity(
                 transform=ax.get_yaxis_transform(),
                 ha="left",
                 va="center",
-                fontsize=8,
+                fontsize=9,
                 color=INK,
             )
 
-        ax.set_title("How far Delta moves when the detector setting moves", loc="left", pad=8)
+        """ax.set_title("Signal accuracy across environments", loc="left", pad=6, fontsize=9)
         missing = (
             ""
             if not omitted
@@ -325,7 +330,7 @@ def figure_delta_sensitivity(
             "stable Delta or a signal that fired only once --- read it with the robustness "
             f"figure.{missing} conv_smooth_window={pin.detector.conv_smooth_window}, "
             f"mode={pin.mode}, clip={pin.clip:g}, correction={pin.correction}.",
-        )
+        )"""
         return _save(fig, path)
 
 
@@ -528,6 +533,95 @@ def _plateau_marks(
                 marks[("t_conv", None)] = float(row["t_conv"])
     return marks
 
+def figure_detector_sensitivity(
+    band: pd.DataFrame,
+    path: Path,
+    *,
+    pin: Pin,
+) -> Path:
+    """Show how plateau-detector parameters affect normalized convergence error.
+
+    The figure evaluates the effect of the detector's threshold ``tau``, smoothing
+    window size, and reference quantile. For each parameter value, observations are
+    first averaged within each environment and then averaged equally across
+    environments, so no environment dominates the result. Markers show the resulting
+    mean normalized Delta, while error bars indicate one standard deviation across
+    environments.
+    """
+
+    settings = [
+        ("tau", r"$\tau$"),
+        ("smooth_window", "window size"),
+        ("reference_quantile", "reference quantile"),
+    ]
+
+    band = band.copy()
+    band["delta_norm"] = band["delta"] / band["total_steps"]
+
+    with plt.rc_context(_style()):
+        fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.7), sharey=True)
+        for ax, (column, xlabel) in zip(axes, settings, strict=True):
+            # Average observations within each environment first.
+            env_means = (
+                band.groupby(["env_id", column],observed=True)["delta_norm"]
+                .mean()
+                .reset_index()
+            )
+            # Then average equally over environments.
+            summary = (
+                env_means.groupby(column, observed=True)["delta_norm"]
+                .agg(mean="mean", std="std", n="count")
+                .reset_index()
+            )
+
+            x = np.arange(len(summary)) - (len(summary) - 1) / 2
+            padding = 0.8
+            ax.set_xlim(
+                x.min() - padding,
+                x.max() + padding,
+            )
+
+            ax.errorbar(
+                x,
+                summary["mean"],
+                yerr=summary["std"],
+                fmt="o",
+                markersize=5,
+                capsize=3,
+                linewidth=1.2,
+                zorder=3,
+            )
+            ax.axhline(
+                0,
+                color=MUTED,
+                linewidth=0.9,
+                linestyle=(0, (4, 3)),
+                zorder=1,
+            )
+
+            ax.set_xticks(x)
+            ax.set_xticklabels([
+                f"{value:g}" if isinstance(value, (float, np.floating)) else str(value)
+                for value in summary[column]
+            ])
+            ax.set_xlabel(xlabel)
+            ax.grid(axis="y", alpha=0.3)
+            ax.set_axisbelow(True)
+
+        axes[0].set_ylabel("$\Delta_{\mathrm{norm}} = (t_{\mathrm{plateau}} - t_{\mathrm{conv}}) / T$")
+        # fig.suptitle("Sensitivity to detector settings", x=0.02, ha="left")
+
+        """_caption(
+            fig,
+            axes[1],
+            "Mean normalized Delta across environments, signals and "
+            "detector configurations. Environments contribute equally. "
+            "Error bars show 95% confidence intervals. Negative values "
+            "indicate early firing; zero indicates alignment with "
+            "convergence; positive values indicate late firing.",
+        )"""
+
+        return _save(fig, path)
 
 def _caption(fig: plt.Figure, axes: Any, text: str, *, gap: float = 0.05) -> None:
     """Put the caption below everything the axes already occupy.

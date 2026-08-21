@@ -39,7 +39,7 @@ from pathlib import Path
 import pandas as pd
 
 from rnd_convergence.analysis import DetectorSpec
-from rnd_convergence.figures import figure_confound, figure_delta_sensitivity, figure_robustness
+from rnd_convergence.figures import figure_confound, figure_delta_sensitivity, figure_robustness, figure_detector_sensitivity
 from rnd_convergence.report import (
     Pin,
     confound_pin,
@@ -188,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     written.append(
         figure_robustness(fired, args.out / f"detector_robustness.{args.format}", pin=pin)
     )
+
     # A rung whose runs never converged has no Delta on any signal, so it has no row in the
     # sensitivity figure. Named in its caption rather than left to look like a missing run.
     omitted = [env for env in summary["env_id"].cat.categories if env not in set(band["env_id"])]
@@ -196,6 +197,20 @@ def main(argv: list[str] | None = None) -> int:
             band, args.out / f"delta_sensitivity.{args.format}", pin=pin, omitted=omitted
         )
     )
+
+    written.append(
+        figure_detector_sensitivity(
+            band, args.out / f"detector_sensitivity.{args.format}", pin=pin
+        )
+    )
+
+    poster_band = band[band["signal_label"].isin(["RND", "SVE grid b10"])].copy()
+    written.append(
+        figure_delta_sensitivity(
+            poster_band, args.out / f"delta_sensitivity_poster.{args.format}", pin=pin, omitted=omitted
+        ) 
+    )
+
     # The confound figure is a comparison, so it is drawn where the detector fires on both
     # conditions; that is not always the table's pinned setting, and the figure says which.
     drawn_at, note = confound_pin(frame, pin, env_id=args.confound_env, seed=args.confound_seed)

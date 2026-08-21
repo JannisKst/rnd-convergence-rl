@@ -411,3 +411,4 @@ exercise repo is not a dependency.
 - Burda et al., 2018 — [Exploration by Random Network Distillation](https://arxiv.org/abs/1810.12894)
 - Schulman et al., 2017 — [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
 - Bellemare et al., 2016 — [Unifying Count-Based Exploration and Intrinsic Motivation](https://arxiv.org/abs/1606.01868)
+- Kozachenko and Leonenko, 1987 - [Sample Estimate of the Entropy of a Random Vector](https://ui.adsabs.harvard.edu/abs/1987PrIT...23...95K)
